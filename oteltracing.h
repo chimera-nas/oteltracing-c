@@ -143,6 +143,17 @@ void otel_thread_unregister(void);
 typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
 void otel_set_transport(otel_transport_fn fn, void *priv);
 
+/*
+ * Head-sampling ratio in [0,1]: the probability that a newly started (root)
+ * trace is recorded.  1.0 (the default) records every trace; 0.0 records none;
+ * 0.01 records roughly 1 in 100.  The decision is made once, when a root span
+ * starts, using a fast per-thread PRNG, and is inherited by the entire trace
+ * (every child span).  Spans belonging to an unsampled trace are not recorded,
+ * so the inline hot path below short-circuits to nothing.  Thread-safe to set at
+ * startup; treat as configuration, not a per-request knob.
+ */
+void otel_set_sampler(double ratio);
+
 /* Override the wall-clock source (default clock_gettime(CLOCK_REALTIME)).  Lets
  * the embedder inject a TSC-backed clock.  Must return nanoseconds since the
  * Unix epoch. */
@@ -159,38 +170,172 @@ int  otel_drain(void);
 /* Diagnostics: monotonically-increasing counters. */
 uint64_t otel_dropped_spans(void);  /* spans dropped due to staging overflow */
 
-/* ---- span hot path (no malloc, no locks) ---- */
+/* ---- span hot path (no malloc, no locks) ----
+ *
+ * The recording (sampled) decision lives in the span's flags.  The inline
+ * wrappers below test that bit first, so every operation on a span belonging to
+ * an unsampled trace compiles to a flag test and an immediate return -- no call
+ * into the library, no work.  Only the cases that actually touch library state
+ * (deciding sampling for a root, generating ids, stamping the clock, staging a
+ * finished span) fall through to the out-of-line slow paths.
+ */
 
-/* Start a new root span (begins a fresh trace). */
-void otel_span_start(struct otel_span *s, const char *name, enum otel_span_kind kind);
+/* Internal: live (a transport is registered) and slow paths.  Do not call the
+ * trailing-underscore symbols directly; use the inline wrappers. */
+extern int otel_enabled_;
+void otel_span_start_root_(struct otel_span *s, const char *name, uint8_t kind);
+void otel_span_start_child_(struct otel_span *s, const char *name, uint8_t kind,
+                            const struct otel_span *parent);
+void otel_span_start_remote_(struct otel_span *s, const char *name, uint8_t kind,
+                             const uint8_t trace_id[16], uint64_t parent_id);
+void otel_span_event_(struct otel_span *s, const char *name);
+void otel_span_end_(struct otel_span *s);
 
-/* Start a child span: inherits parent's trace_id, parent_id = parent's span_id. */
-void otel_span_start_child(struct otel_span *s, const char *name,
-                           enum otel_span_kind kind, const struct otel_span *parent);
+/* Start a new root span (begins a fresh trace; sampling is decided here). */
+static inline void
+otel_span_start(struct otel_span *s, const char *name, enum otel_span_kind kind)
+{
+    if (!otel_enabled_) {
+        s->flags = 0;
+        return;
+    }
+    otel_span_start_root_(s, name, (uint8_t) kind);
+}
 
-/* Start a span from a remote/propagated context (16-byte trace id + parent span id). */
-void otel_span_start_remote(struct otel_span *s, const char *name,
-                            enum otel_span_kind kind,
-                            const uint8_t trace_id[16], uint64_t parent_id);
+/* Start a child span: inherits the parent's trace and sampling decision.  If the
+ * parent is not recording (unsampled trace, or tracing off), this is just a flag
+ * clear -- the fast path. */
+static inline void
+otel_span_start_child(struct otel_span *s, const char *name,
+                      enum otel_span_kind kind, const struct otel_span *parent)
+{
+    if (!parent || !(parent->flags & OTEL_FLAG_RECORDING)) {
+        s->flags = 0;
+        return;
+    }
+    otel_span_start_child_(s, name, (uint8_t) kind, parent);
+}
 
-/* Add attributes / events.  Safe to call from a thread the request was handed
- * to mid-flight.  Silently dropped (and counted) past the inline capacity, or
- * if the span is not recording. */
-void otel_span_attr_str(struct otel_span *s, const char *key, const char *value);
-void otel_span_attr_i64(struct otel_span *s, const char *key, int64_t value);
-void otel_span_attr_u64(struct otel_span *s, const char *key, uint64_t value);
-void otel_span_attr_bool(struct otel_span *s, const char *key, int value);
-void otel_span_event(struct otel_span *s, const char *name);
-
-/* Set the span status (e.g. on error).  message is borrowed. */
-void otel_span_set_status(struct otel_span *s, enum otel_status status,
-                          const char *message);
-
-/* End the span on its home thread: stamps end time and stages it for emission. */
-void otel_span_end(struct otel_span *s);
+/* Start a span from a propagated context.  `sampled` carries the upstream
+ * sampling decision (e.g. the W3C traceparent sampled flag); when 0 the trace is
+ * not recorded here either. */
+static inline void
+otel_span_start_remote(struct otel_span *s, const char *name,
+                       enum otel_span_kind kind,
+                       const uint8_t trace_id[16], uint64_t parent_id, int sampled)
+{
+    if (!otel_enabled_ || !sampled) {
+        s->flags = 0;
+        return;
+    }
+    otel_span_start_remote_(s, name, (uint8_t) kind, trace_id, parent_id);
+}
 
 /* True if the span is being recorded (callers may skip building attrs if not). */
-int  otel_span_recording(const struct otel_span *s);
+static inline int
+otel_span_recording(const struct otel_span *s)
+{
+    return (s->flags & OTEL_FLAG_RECORDING) != 0;
+}
+
+/* Internal: claim the next inline attribute slot, or NULL if not recording or
+ * full (dropped + counted). */
+static inline struct otel_attr *
+otel_span_attr_(struct otel_span *s, const char *key)
+{
+    struct otel_attr *a;
+
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return (struct otel_attr *) 0;
+    }
+    if (s->num_attrs >= OTEL_SPAN_MAX_ATTRS) {
+        if (s->dropped_attrs < 255) {
+            s->dropped_attrs++;
+        }
+        return (struct otel_attr *) 0;
+    }
+    a      = &s->attrs[s->num_attrs++];
+    a->key = key;
+    return a;
+}
+
+/* Add attributes / events.  Safe to call from a thread the request was handed to
+ * mid-flight (these touch only the embedded span).  No-op on an unsampled trace;
+ * dropped + counted past the inline capacity. */
+static inline void
+otel_span_attr_str(struct otel_span *s, const char *key, const char *value)
+{
+    struct otel_attr *a = otel_span_attr_(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_STR;
+        a->v.s  = value;
+    }
+}
+
+static inline void
+otel_span_attr_i64(struct otel_span *s, const char *key, int64_t value)
+{
+    struct otel_attr *a = otel_span_attr_(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_I64;
+        a->v.i  = value;
+    }
+}
+
+static inline void
+otel_span_attr_u64(struct otel_span *s, const char *key, uint64_t value)
+{
+    struct otel_attr *a = otel_span_attr_(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_U64;
+        a->v.u  = value;
+    }
+}
+
+static inline void
+otel_span_attr_bool(struct otel_span *s, const char *key, int value)
+{
+    struct otel_attr *a = otel_span_attr_(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_BOOL;
+        a->v.b  = value ? 1 : 0;
+    }
+}
+
+static inline void
+otel_span_event(struct otel_span *s, const char *name)
+{
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return;
+    }
+    otel_span_event_(s, name);   /* slow path: needs the clock */
+}
+
+/* Set the span status (e.g. on error).  message is borrowed. */
+static inline void
+otel_span_set_status(struct otel_span *s, enum otel_status status,
+                     const char *message)
+{
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return;
+    }
+    s->status         = (uint8_t) status;
+    s->status_message = message;
+}
+
+/* End the span on its home thread: stamps end time and stages it for emission. */
+static inline void
+otel_span_end(struct otel_span *s)
+{
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return;
+    }
+    otel_span_end_(s);   /* slow path: stamps end time, stages for export */
+}
 
 #ifdef __cplusplus
 }

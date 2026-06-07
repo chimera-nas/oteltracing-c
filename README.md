@@ -122,11 +122,12 @@ otel_span_end(&child);
 ```
 
 To continue a trace started elsewhere (distributed propagation), seed from a
-remote context:
+remote context. `sampled` carries the upstream decision (e.g. the W3C
+`traceparent` sampled flag):
 
 ```c
 otel_span_start_remote(&span, "rpc", OTEL_SPAN_SERVER, trace_id /*16 bytes*/,
-                       parent_span_id);
+                       parent_span_id, sampled /* 0 or 1 */);
 ```
 
 Record an error status:
@@ -148,6 +149,23 @@ for (;;) {
 }
 ```
 
+### Sampling
+
+By default every trace is recorded. To sample probabilistically, set a ratio in
+`[0,1]` — the chance that a new (root) trace is recorded:
+
+```c
+otel_set_sampler(0.01);   /* record ~1 in 100 traces */
+```
+
+The decision is made **once**, with a fast per-thread PRNG, when a root span
+starts, and is inherited by the whole trace — every child span sees the same
+recording bit. For traces that aren't sampled, the inline `otel_span_*` calls
+in the header compile down to a flag test and an immediate return: no library
+call, no id generation, no allocation. So you can leave instrumentation calls in
+hot paths and pay almost nothing when a trace isn't being recorded. Set the
+ratio once at startup (it's configuration, not a per-request control).
+
 ### 4. Shut down
 
 ```c
@@ -163,6 +181,7 @@ otel_shutdown();                      /* drains remaining spans, frees state */
 | `otel_shutdown()` | Drain and tear down. |
 | `otel_thread_register()` / `otel_thread_unregister()` | Per-thread span staging (for threads that start/end spans). |
 | `otel_set_transport(fn, priv)` | Register the callback that ships gRPC-framed OTLP buffers. |
+| `otel_set_sampler(ratio)` | Probability `[0,1]` that a new trace is recorded (default 1.0). |
 | `otel_set_clock(now_unix_ns)` | Override the wall-clock source (returns ns since the Unix epoch). |
 | `otel_drain()` | Encode and export finished spans (single consumer). |
 | `otel_dropped_spans()` | Count of spans dropped due to ring overflow. |

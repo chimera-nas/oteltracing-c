@@ -132,13 +132,17 @@ struct otel_otlp {
 
 static struct {
     int                       initialized;
-    int                       enabled;        /* init + transport registered */
     char                      service[128];
     char                      hostname[128];
 
     otel_transport_fn         transport;
     void                     *transport_priv;
     uint64_t                (*clock)(void);
+
+    /* Head sampling: record every root trace when sample_always, else record
+     * when otel_rand() < sample_threshold (== ratio * 2^64). */
+    int                       sample_always;
+    uint64_t                  sample_threshold;
 
     pthread_rwlock_t          registry_lock;  /* guards the thread-ctx list */
     struct otel_thread_ctx   *threads;
@@ -158,6 +162,10 @@ static struct {
 
 static __thread struct otel_thread_ctx *otel_tls;
 
+/* Live flag, read inline from the header hot path; set once a transport is
+ * registered.  Exported so the inline wrappers in other TUs resolve it. */
+SYMBOL_EXPORT int otel_enabled_ = 0;
+
 /* ---- clock ---- */
 
 static uint64_t
@@ -170,6 +178,22 @@ SYMBOL_EXPORT void
 otel_set_clock(uint64_t (*now_unix_ns)(void))
 {
     OT.clock = now_unix_ns ? now_unix_ns : otel_default_clock;
+}
+
+SYMBOL_EXPORT void
+otel_set_sampler(double ratio)
+{
+    if (ratio >= 1.0) {
+        OT.sample_always    = 1;
+        OT.sample_threshold = ~0ULL;
+    } else if (ratio <= 0.0) {
+        OT.sample_always    = 0;
+        OT.sample_threshold = 0;
+    } else {
+        /* threshold = ratio * 2^64; record when otel_rand() < threshold. */
+        OT.sample_always    = 0;
+        OT.sample_threshold = (uint64_t) (ratio * 18446744073709551616.0);
+    }
 }
 
 /* ---- id generation (PCG-style multiplicative, uuid-seeded per thread) ---- */
@@ -210,6 +234,12 @@ otel_init(const char *service)
     }
 
     OT.clock = otel_default_clock;
+
+    /* Default: sample every trace.  Override with otel_set_sampler(). */
+    OT.sample_always    = 1;
+    OT.sample_threshold = ~0ULL;
+    otel_enabled_       = 0;
+
     pthread_rwlock_init(&OT.registry_lock, NULL);
     pthread_mutex_init(&OT.drain_lock, NULL);
 
@@ -286,7 +316,7 @@ otel_set_transport(
 {
     OT.transport      = fn;
     OT.transport_priv = priv;
-    OT.enabled        = (OT.initialized && fn != NULL);
+    otel_enabled_     = (OT.initialized && fn != NULL);
 }
 
 SYMBOL_EXPORT void
@@ -335,7 +365,7 @@ otel_thread_unregister(void)
      * sole consumer for this ring one last time, unlink, and free. */
     pthread_rwlock_wrlock(&OT.registry_lock);
 
-    if (OT.enabled) {
+    if (otel_enabled_) {
         pthread_mutex_lock(&OT.drain_lock);
         otel_drain_ctx(ctx);
         pthread_mutex_unlock(&OT.drain_lock);
@@ -361,7 +391,7 @@ otel_shutdown(void)
         return;
     }
 
-    if (OT.enabled) {
+    if (otel_enabled_) {
         otel_drain();
     }
 
@@ -380,16 +410,20 @@ otel_shutdown(void)
     pthread_mutex_destroy(&OT.drain_lock);
 
     OT.initialized = 0;
-    OT.enabled     = 0;
+    otel_enabled_  = 0;
 }
 
-/* ---- span hot path ---- */
+/* ---- span hot path: slow paths only ----
+ *
+ * The inline wrappers and the unsampled fast path live in oteltracing.h; these
+ * out-of-line functions run only when a span is actually being recorded (or to
+ * decide sampling for a root span). */
 
 static inline void
 otel_span_init(
-    struct otel_span   *s,
-    const char         *name,
-    enum otel_span_kind kind)
+    struct otel_span *s,
+    const char       *name,
+    uint8_t           kind)
 {
     s->name           = name;
     s->kind           = (uint8_t) kind;
@@ -405,14 +439,22 @@ otel_span_init(
 }
 
 SYMBOL_EXPORT void
-otel_span_start(
-    struct otel_span   *s,
-    const char         *name,
-    enum otel_span_kind kind)
+otel_span_start_root_(
+    struct otel_span *s,
+    const char       *name,
+    uint8_t           kind)
 {
     struct otel_thread_ctx *ctx = otel_tls;
 
-    if (!OT.enabled || !ctx) {
+    if (!ctx) {
+        s->flags = 0;
+        return;
+    }
+
+    /* Head sampling: record every trace when sample_always is set, otherwise
+     * draw the per-thread PRNG once and compare against the configured
+     * threshold (threshold = ratio * 2^64). */
+    if (!OT.sample_always && otel_rand(ctx) >= OT.sample_threshold) {
         s->flags = 0;
         return;
     }
@@ -425,15 +467,15 @@ otel_span_start(
 }
 
 SYMBOL_EXPORT void
-otel_span_start_child(
+otel_span_start_child_(
     struct otel_span       *s,
     const char             *name,
-    enum otel_span_kind     kind,
+    uint8_t                 kind,
     const struct otel_span *parent)
 {
     struct otel_thread_ctx *ctx = otel_tls;
 
-    if (!OT.enabled || !ctx || !parent || !(parent->flags & OTEL_FLAG_RECORDING)) {
+    if (!ctx) {
         s->flags = 0;
         return;
     }
@@ -445,16 +487,16 @@ otel_span_start_child(
 }
 
 SYMBOL_EXPORT void
-otel_span_start_remote(
-    struct otel_span   *s,
-    const char         *name,
-    enum otel_span_kind kind,
-    const uint8_t       trace_id[16],
-    uint64_t            parent_id)
+otel_span_start_remote_(
+    struct otel_span *s,
+    const char       *name,
+    uint8_t           kind,
+    const uint8_t     trace_id[16],
+    uint64_t          parent_id)
 {
     struct otel_thread_ctx *ctx = otel_tls;
 
-    if (!OT.enabled || !ctx) {
+    if (!ctx) {
         s->flags = 0;
         return;
     }
@@ -465,97 +507,13 @@ otel_span_start_remote(
     otel_span_init(s, name, kind);
 }
 
-SYMBOL_EXPORT int
-otel_span_recording(const struct otel_span *s)
-{
-    return (s->flags & OTEL_FLAG_RECORDING) != 0;
-}
-
-static inline struct otel_attr *
-otel_attr_slot(struct otel_span *s, const char *key)
-{
-    struct otel_attr *a;
-
-    if (!(s->flags & OTEL_FLAG_RECORDING)) {
-        return NULL;
-    }
-    if (s->num_attrs >= OTEL_SPAN_MAX_ATTRS) {
-        if (s->dropped_attrs < 255) {
-            s->dropped_attrs++;
-        }
-        return NULL;
-    }
-    a = &s->attrs[s->num_attrs++];
-    a->key = key;
-    return a;
-}
-
 SYMBOL_EXPORT void
-otel_span_attr_str(
-    struct otel_span *s,
-    const char       *key,
-    const char       *value)
-{
-    struct otel_attr *a = otel_attr_slot(s, key);
-
-    if (a) {
-        a->type = OTEL_ATTR_STR;
-        a->v.s  = value;
-    }
-}
-
-SYMBOL_EXPORT void
-otel_span_attr_i64(
-    struct otel_span *s,
-    const char       *key,
-    int64_t           value)
-{
-    struct otel_attr *a = otel_attr_slot(s, key);
-
-    if (a) {
-        a->type = OTEL_ATTR_I64;
-        a->v.i  = value;
-    }
-}
-
-SYMBOL_EXPORT void
-otel_span_attr_u64(
-    struct otel_span *s,
-    const char       *key,
-    uint64_t          value)
-{
-    struct otel_attr *a = otel_attr_slot(s, key);
-
-    if (a) {
-        a->type = OTEL_ATTR_U64;
-        a->v.u  = value;
-    }
-}
-
-SYMBOL_EXPORT void
-otel_span_attr_bool(
-    struct otel_span *s,
-    const char       *key,
-    int               value)
-{
-    struct otel_attr *a = otel_attr_slot(s, key);
-
-    if (a) {
-        a->type = OTEL_ATTR_BOOL;
-        a->v.b  = value ? 1 : 0;
-    }
-}
-
-SYMBOL_EXPORT void
-otel_span_event(
+otel_span_event_(
     struct otel_span *s,
     const char       *name)
 {
     struct otel_event *e;
 
-    if (!(s->flags & OTEL_FLAG_RECORDING)) {
-        return;
-    }
     if (s->num_events >= OTEL_SPAN_MAX_EVENTS) {
         if (s->dropped_events < 255) {
             s->dropped_events++;
@@ -568,27 +526,10 @@ otel_span_event(
 }
 
 SYMBOL_EXPORT void
-otel_span_set_status(
-    struct otel_span *s,
-    enum otel_status  status,
-    const char       *message)
-{
-    if (!(s->flags & OTEL_FLAG_RECORDING)) {
-        return;
-    }
-    s->status         = (uint8_t) status;
-    s->status_message = message;
-}
-
-SYMBOL_EXPORT void
-otel_span_end(struct otel_span *s)
+otel_span_end_(struct otel_span *s)
 {
     struct otel_thread_ctx *ctx = otel_tls;
     uint64_t                head, tail;
-
-    if (!(s->flags & OTEL_FLAG_RECORDING)) {
-        return;
-    }
 
     s->end_unix_ns = OT.clock();
 
@@ -776,7 +717,7 @@ otel_drain(void)
     struct otel_thread_ctx *ctx;
     int                     n = 0;
 
-    if (!OT.enabled) {
+    if (!otel_enabled_) {
         return 0;
     }
 

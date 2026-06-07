@@ -158,6 +158,45 @@ main(void)
             req, NULL);
     }
 
+    /* ---- sampling ---- */
+
+    /* ratio 0.0: no trace is recorded; children of an unsampled root inherit
+     * that, and operations short-circuit (end is a no-op). */
+    otel_set_sampler(0.0);
+    struct otel_span s0, c0;
+    otel_span_start(&s0, "unsampled", OTEL_SPAN_INTERNAL);
+    CHECK(!otel_span_recording(&s0));
+    otel_span_start_child(&c0, "unsampled-child", OTEL_SPAN_INTERNAL, &s0);
+    CHECK(!otel_span_recording(&c0));
+    otel_span_attr_str(&c0, "k", "v");           /* no-op, must not crash */
+    otel_span_end(&c0);
+    otel_span_end(&s0);
+    CHECK(otel_drain() == 0);                     /* nothing was staged */
+
+    /* ratio 1.0: every trace is recorded. */
+    otel_set_sampler(1.0);
+    struct otel_span s1;
+    otel_span_start(&s1, "sampled", OTEL_SPAN_INTERNAL);
+    CHECK(otel_span_recording(&s1));
+    otel_span_end(&s1);
+    CHECK(otel_drain() == 1);
+
+    /* ratio 0.5: roughly half of independent traces are recorded. */
+    otel_set_sampler(0.5);
+    int rec = 0, N = 4000;
+    for (int k = 0; k < N; k++) {
+        struct otel_span sp;
+        otel_span_start(&sp, "p", OTEL_SPAN_INTERNAL);
+        if (otel_span_recording(&sp)) {
+            rec++;
+        }
+        otel_span_end(&sp);
+        otel_drain();                            /* keep the ring from filling */
+    }
+    CHECK(rec > N / 4 && rec < (3 * N) / 4);     /* loose bound around N/2 */
+
+    otel_set_sampler(1.0);
+
     otel_thread_unregister();
     otel_shutdown();
 
