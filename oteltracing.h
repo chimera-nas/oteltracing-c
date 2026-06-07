@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Ben Jarvis
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 /*
  * oteltracing-c -- a lightweight OpenTelemetry span tracer for C.

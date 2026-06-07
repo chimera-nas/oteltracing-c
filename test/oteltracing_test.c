@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Ben Jarvis
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 /*
  * Standalone decode-verify test: register a stub transport that captures the
