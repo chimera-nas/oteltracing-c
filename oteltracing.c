@@ -29,6 +29,8 @@
 
 #include "oteltracing.h"
 
+#include "stopwatch.h"
+
 #include "opentelemetry/proto/collector/trace/v1/trace_service.pb-c.h"
 #include "opentelemetry/proto/trace/v1/trace.pb-c.h"
 #include "opentelemetry/proto/common/v1/common.pb-c.h"
@@ -145,6 +147,13 @@ static struct {
     struct otel_otlp          otlp;
 
     _Atomic uint64_t          dropped_spans;   /* aggregated, plus per-thread */
+
+    /* TSC-backed wall clock (shared stopwatch subproject): wall-clock anchor
+     * captured once at init, absolute time = anchor + elapsed ticks since.  Keeps
+     * the per-span time path off clock_gettime; read-only after init. */
+    struct stopwatch_context  sw_ctx;
+    struct stopwatch          sw_base;
+    uint64_t                  wall_base_ns;
 } OT;
 
 static __thread struct otel_thread_ctx *otel_tls;
@@ -154,10 +163,7 @@ static __thread struct otel_thread_ctx *otel_tls;
 static uint64_t
 otel_default_clock(void)
 {
-    struct timespec ts;
-
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+    return OT.wall_base_ns + stopwatch_elapsed_ns(&OT.sw_ctx, &OT.sw_base);
 }
 
 SYMBOL_EXPORT void
@@ -191,6 +197,17 @@ otel_init(const char *service)
         snprintf(OT.hostname, sizeof(OT.hostname), "unknown");
     }
     OT.hostname[sizeof(OT.hostname) - 1] = '\0';
+
+    /* Anchor the TSC-backed wall clock: capture CLOCK_REALTIME once, then track
+     * absolute time as that anchor plus monotonic elapsed ns from the stopwatch. */
+    {
+        struct timespec ts;
+        stopwatch_context_init(&OT.sw_ctx);
+        clock_gettime(CLOCK_REALTIME, &ts);
+        OT.wall_base_ns = (uint64_t) ts.tv_sec * 1000000000ULL +
+            (uint64_t) ts.tv_nsec;
+        stopwatch_start(&OT.sw_ctx, &OT.sw_base);
+    }
 
     OT.clock = otel_default_clock;
     pthread_rwlock_init(&OT.registry_lock, NULL);

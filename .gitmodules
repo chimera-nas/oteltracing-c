@@ -1,0 +1,3 @@
+[submodule "ext/stopwatch"]
+	path = ext/stopwatch
+	url = https://github.com/chimera-nas/stopwatch.git

@@ -48,10 +48,13 @@ add_library(oteltracing-c SHARED
 
 target_compile_options(oteltracing-c PRIVATE -O3 -Wall -Werror -fvisibility=hidden)
 
-# Generated headers land under the binary dir; the public header alongside source.
+# Generated headers land under the binary dir; the public header alongside
+# source.  The stopwatch submodule is header-only and used only internally, so
+# its include path is PRIVATE.
 target_include_directories(oteltracing-c
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
-    PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/ext/stopwatch)
 
 target_link_libraries(oteltracing-c ${PROTOBUF_C_LIB} uuid pthread)
 
