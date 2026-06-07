@@ -1,0 +1,784 @@
+// SPDX-FileCopyrightText: 2026 Ben Jarvis
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * oteltracing-c implementation.  See oteltracing.h for the model.
+ *
+ * Hot path (otel_span_start/attr/event/end): touches only the caller's embedded
+ * span plus, at end(), the home thread's lock-free SPSC ring -- no malloc, no
+ * locks.  Finished spans are copied (POD, attrs/events inline) into the ring.
+ *
+ * otel_drain() is the single consumer: it walks the registered thread contexts,
+ * drains each ring, maps spans into a pre-allocated protobuf-c batch, packs the
+ * OTLP ExportTraceServiceRequest, prepends the 5-byte gRPC frame header, and
+ * hands the buffer to the registered transport callback.
+ */
+
+#define _GNU_SOURCE 1
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
+#include <arpa/inet.h>
+#include <uuid/uuid.h>
+
+#include "oteltracing.h"
+
+#include "opentelemetry/proto/collector/trace/v1/trace_service.pb-c.h"
+#include "opentelemetry/proto/trace/v1/trace.pb-c.h"
+#include "opentelemetry/proto/common/v1/common.pb-c.h"
+#include "opentelemetry/proto/resource/v1/resource.pb-c.h"
+
+#ifndef SYMBOL_EXPORT
+#define SYMBOL_EXPORT __attribute__((visibility("default")))
+#endif
+
+/* Per-thread ring capacity (spans).  Power of two.  Allocated once at thread
+ * registration; ring-full simply drops + counts. */
+#ifndef OTEL_RING_SIZE
+#define OTEL_RING_SIZE 2048
+#endif
+
+/* Max spans packed into a single ExportTraceServiceRequest. */
+#define OTEL_BATCH_SPANS 256
+#define OTEL_BATCH_ATTRS (OTEL_BATCH_SPANS * OTEL_SPAN_MAX_ATTRS)
+#define OTEL_BATCH_EVENTS (OTEL_BATCH_SPANS * OTEL_SPAN_MAX_EVENTS)
+
+/* Generous upper bound on a packed span; the request scratch is sized from it. */
+#define OTEL_SPAN_SERIALIZATION 4096
+
+typedef Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest otlp_request_t;
+typedef Opentelemetry__Proto__Trace__V1__ResourceSpans                        otlp_rspans_t;
+typedef Opentelemetry__Proto__Trace__V1__ScopeSpans                           otlp_sspans_t;
+typedef Opentelemetry__Proto__Trace__V1__Span                                 otlp_span_t;
+typedef Opentelemetry__Proto__Trace__V1__Status                               otlp_status_t;
+typedef Opentelemetry__Proto__Trace__V1__Span__Event                          otlp_event_t;
+typedef Opentelemetry__Proto__Resource__V1__Resource                          otlp_resource_t;
+typedef Opentelemetry__Proto__Common__V1__InstrumentationScope                otlp_scope_t;
+typedef Opentelemetry__Proto__Common__V1__KeyValue                            otlp_kv_t;
+typedef Opentelemetry__Proto__Common__V1__AnyValue                            otlp_any_t;
+
+#define OTLP_KIND_INTERNAL OPENTELEMETRY__PROTO__TRACE__V1__SPAN__SPAN_KIND__SPAN_KIND_INTERNAL
+#define OTLP_KIND_SERVER   OPENTELEMETRY__PROTO__TRACE__V1__SPAN__SPAN_KIND__SPAN_KIND_SERVER
+#define OTLP_KIND_CLIENT   OPENTELEMETRY__PROTO__TRACE__V1__SPAN__SPAN_KIND__SPAN_KIND_CLIENT
+#define OTLP_KIND_PRODUCER OPENTELEMETRY__PROTO__TRACE__V1__SPAN__SPAN_KIND__SPAN_KIND_PRODUCER
+#define OTLP_KIND_CONSUMER OPENTELEMETRY__PROTO__TRACE__V1__SPAN__SPAN_KIND__SPAN_KIND_CONSUMER
+
+#define OTLP_ANY_STR OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE
+#define OTLP_ANY_INT OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_INT_VALUE
+#define OTLP_ANY_DBL OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_DOUBLE_VALUE
+#define OTLP_ANY_BOOL OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BOOL_VALUE
+
+#define OTLP_STATUS_OK    OPENTELEMETRY__PROTO__TRACE__V1__STATUS__STATUS_CODE__STATUS_CODE_OK
+#define OTLP_STATUS_ERROR OPENTELEMETRY__PROTO__TRACE__V1__STATUS__STATUS_CODE__STATUS_CODE_ERROR
+#define OTLP_STATUS_UNSET OPENTELEMETRY__PROTO__TRACE__V1__STATUS__STATUS_CODE__STATUS_CODE_UNSET
+
+/* gRPC length-prefixed message framing: 1-byte compression flag + 4-byte
+ * big-endian length, immediately followed by the protobuf payload. */
+struct grpc_hdr {
+    uint8_t  compressed;
+    uint32_t length;
+} __attribute__((packed));
+
+/* Per-thread context: a lock-free SPSC ring of finished spans.  The home thread
+ * is the sole producer (head); otel_drain() is the sole consumer (tail). */
+struct otel_thread_ctx {
+    struct otel_span        *ring;       /* OTEL_RING_SIZE slots */
+    _Atomic uint64_t         head;       /* producer cursor */
+    _Atomic uint64_t         tail;       /* consumer cursor */
+    _Atomic uint64_t         dropped;    /* ring-full drops on this thread */
+    __uint128_t              randstate;  /* PCG-style id generator state */
+    struct otel_thread_ctx  *next;       /* global registry list */
+};
+
+/* Pre-allocated protobuf-c batch, reused across flushes by the single drainer. */
+struct otel_otlp {
+    otlp_request_t   request;
+    otlp_resource_t  resource;
+    otlp_rspans_t    rspans;
+    otlp_rspans_t   *rspansp;
+    otlp_sspans_t    sspans;
+    otlp_sspans_t   *sspansp;
+    otlp_scope_t     scope;
+
+    otlp_kv_t        res_attr[2];
+    otlp_kv_t       *res_attrp[2];
+    otlp_any_t       res_attr_val[2];
+
+    otlp_span_t      spans[OTEL_BATCH_SPANS];
+    otlp_span_t     *spansp[OTEL_BATCH_SPANS];
+    otlp_status_t    status[OTEL_BATCH_SPANS];
+
+    otlp_kv_t        attr[OTEL_BATCH_ATTRS];
+    otlp_kv_t       *attrp[OTEL_BATCH_ATTRS];
+    otlp_any_t       attr_val[OTEL_BATCH_ATTRS];
+
+    otlp_event_t     event[OTEL_BATCH_EVENTS];
+    otlp_event_t    *eventp[OTEL_BATCH_EVENTS];
+
+    size_t           num_attrs;
+    size_t           num_events;
+
+    uint8_t         *buf;       /* gRPC frame hdr + packed protobuf */
+    size_t           buf_size;
+};
+
+static struct {
+    int                       initialized;
+    int                       enabled;        /* init + transport registered */
+    char                      service[128];
+    char                      hostname[128];
+
+    otel_transport_fn         transport;
+    void                     *transport_priv;
+    uint64_t                (*clock)(void);
+
+    pthread_rwlock_t          registry_lock;  /* guards the thread-ctx list */
+    struct otel_thread_ctx   *threads;
+
+    pthread_mutex_t           drain_lock;      /* serializes otel_drain + batch */
+    struct otel_otlp          otlp;
+
+    _Atomic uint64_t          dropped_spans;   /* aggregated, plus per-thread */
+} OT;
+
+static __thread struct otel_thread_ctx *otel_tls;
+
+/* ---- clock ---- */
+
+static uint64_t
+otel_default_clock(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+SYMBOL_EXPORT void
+otel_set_clock(uint64_t (*now_unix_ns)(void))
+{
+    OT.clock = now_unix_ns ? now_unix_ns : otel_default_clock;
+}
+
+/* ---- id generation (PCG-style multiplicative, uuid-seeded per thread) ---- */
+
+static inline uint64_t
+otel_rand(struct otel_thread_ctx *ctx)
+{
+    ctx->randstate *= (__uint128_t) UINT64_C(0xda942042e4dd58b5);
+    return (uint64_t) (ctx->randstate >> 64);
+}
+
+/* ---- process / thread lifecycle ---- */
+
+SYMBOL_EXPORT int
+otel_init(const char *service)
+{
+    if (OT.initialized) {
+        return 0;
+    }
+
+    memset(&OT, 0, sizeof(OT));
+
+    snprintf(OT.service, sizeof(OT.service), "%s", service ? service : "unknown");
+    if (gethostname(OT.hostname, sizeof(OT.hostname)) != 0) {
+        snprintf(OT.hostname, sizeof(OT.hostname), "unknown");
+    }
+    OT.hostname[sizeof(OT.hostname) - 1] = '\0';
+
+    OT.clock = otel_default_clock;
+    pthread_rwlock_init(&OT.registry_lock, NULL);
+    pthread_mutex_init(&OT.drain_lock, NULL);
+
+    /* One-time init of the reused protobuf-c batch scaffolding. */
+    struct otel_otlp *o = &OT.otlp;
+    size_t i;
+
+    opentelemetry__proto__collector__trace__v1__export_trace_service_request__init(&o->request);
+    opentelemetry__proto__trace__v1__resource_spans__init(&o->rspans);
+    opentelemetry__proto__trace__v1__scope_spans__init(&o->sspans);
+    opentelemetry__proto__resource__v1__resource__init(&o->resource);
+    opentelemetry__proto__common__v1__instrumentation_scope__init(&o->scope);
+
+    o->scope.name    = OT.service;
+    o->scope.version = "0.1.0";
+
+    for (i = 0; i < 2; i++) {
+        opentelemetry__proto__common__v1__key_value__init(&o->res_attr[i]);
+        opentelemetry__proto__common__v1__any_value__init(&o->res_attr_val[i]);
+        o->res_attr[i].value = &o->res_attr_val[i];
+        o->res_attr_val[i].value_case = OTLP_ANY_STR;
+        o->res_attrp[i] = &o->res_attr[i];
+    }
+    o->res_attr[0].key = "service.name";
+    o->res_attr_val[0].string_value = OT.service;
+    o->res_attr[1].key = "host.name";
+    o->res_attr_val[1].string_value = OT.hostname;
+
+    o->resource.n_attributes = 2;
+    o->resource.attributes   = o->res_attrp;
+    o->rspans.resource       = &o->resource;
+
+    o->scope.name = OT.service;
+    o->sspans.scope = &o->scope;
+
+    o->rspans.n_scope_spans = 1;
+    o->sspansp = &o->sspans;
+    o->rspans.scope_spans = &o->sspansp;
+
+    o->request.n_resource_spans = 1;
+    o->rspansp = &o->rspans;
+    o->request.resource_spans = &o->rspansp;
+
+    o->sspans.spans = o->spansp;
+
+    for (i = 0; i < OTEL_BATCH_SPANS; i++) {
+        opentelemetry__proto__trace__v1__span__init(&o->spans[i]);
+        opentelemetry__proto__trace__v1__status__init(&o->status[i]);
+        o->spans[i].status = &o->status[i];
+        o->spansp[i] = &o->spans[i];
+    }
+    for (i = 0; i < OTEL_BATCH_ATTRS; i++) {
+        opentelemetry__proto__common__v1__key_value__init(&o->attr[i]);
+        opentelemetry__proto__common__v1__any_value__init(&o->attr_val[i]);
+        o->attr[i].value = &o->attr_val[i];
+        o->attrp[i] = &o->attr[i];
+    }
+    for (i = 0; i < OTEL_BATCH_EVENTS; i++) {
+        opentelemetry__proto__trace__v1__span__event__init(&o->event[i]);
+        o->eventp[i] = &o->event[i];
+    }
+
+    o->buf_size = sizeof(struct grpc_hdr) + OTEL_BATCH_SPANS * OTEL_SPAN_SERIALIZATION;
+    o->buf = malloc(o->buf_size);
+
+    OT.initialized = 1;
+    return o->buf ? 0 : -1;
+}
+
+SYMBOL_EXPORT void
+otel_set_transport(
+    otel_transport_fn fn,
+    void             *priv)
+{
+    OT.transport      = fn;
+    OT.transport_priv = priv;
+    OT.enabled        = (OT.initialized && fn != NULL);
+}
+
+SYMBOL_EXPORT void
+otel_thread_register(void)
+{
+    struct otel_thread_ctx *ctx;
+
+    if (otel_tls) {
+        return;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    ctx->ring = calloc(OTEL_RING_SIZE, sizeof(struct otel_span));
+    atomic_store_explicit(&ctx->head, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx->tail, 0, memory_order_relaxed);
+
+    /* Seed the per-thread id generator with a high-quality random value. */
+    uuid_generate((unsigned char *) &ctx->randstate);
+    if (ctx->randstate == 0) {
+        ctx->randstate = (__uint128_t) (uintptr_t) ctx ^ OT.clock();
+    }
+
+    pthread_rwlock_wrlock(&OT.registry_lock);
+    ctx->next   = OT.threads;
+    OT.threads  = ctx;
+    pthread_rwlock_unlock(&OT.registry_lock);
+
+    otel_tls = ctx;
+}
+
+/* Drain a single context's ring into the batch / transport.  Caller holds
+ * OT.drain_lock.  Defined below otlp_add_span. */
+static int otel_drain_ctx(struct otel_thread_ctx *ctx);
+
+SYMBOL_EXPORT void
+otel_thread_unregister(void)
+{
+    struct otel_thread_ctx *ctx = otel_tls;
+    struct otel_thread_ctx **pp;
+
+    if (!ctx) {
+        return;
+    }
+
+    /* Take the write lock (excludes any concurrent drain) so we can act as the
+     * sole consumer for this ring one last time, unlink, and free. */
+    pthread_rwlock_wrlock(&OT.registry_lock);
+
+    if (OT.enabled) {
+        pthread_mutex_lock(&OT.drain_lock);
+        otel_drain_ctx(ctx);
+        pthread_mutex_unlock(&OT.drain_lock);
+    }
+
+    for (pp = &OT.threads; *pp; pp = &(*pp)->next) {
+        if (*pp == ctx) {
+            *pp = ctx->next;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&OT.registry_lock);
+
+    free(ctx->ring);
+    free(ctx);
+    otel_tls = NULL;
+}
+
+SYMBOL_EXPORT void
+otel_shutdown(void)
+{
+    if (!OT.initialized) {
+        return;
+    }
+
+    if (OT.enabled) {
+        otel_drain();
+    }
+
+    /* Threads are expected to unregister themselves; free any stragglers. */
+    pthread_rwlock_wrlock(&OT.registry_lock);
+    while (OT.threads) {
+        struct otel_thread_ctx *ctx = OT.threads;
+        OT.threads = ctx->next;
+        free(ctx->ring);
+        free(ctx);
+    }
+    pthread_rwlock_unlock(&OT.registry_lock);
+
+    free(OT.otlp.buf);
+    pthread_rwlock_destroy(&OT.registry_lock);
+    pthread_mutex_destroy(&OT.drain_lock);
+
+    OT.initialized = 0;
+    OT.enabled     = 0;
+}
+
+/* ---- span hot path ---- */
+
+static inline void
+otel_span_init(
+    struct otel_span   *s,
+    const char         *name,
+    enum otel_span_kind kind)
+{
+    s->name           = name;
+    s->kind           = (uint8_t) kind;
+    s->status         = OTEL_STATUS_UNSET;
+    s->status_message = NULL;
+    s->num_attrs      = 0;
+    s->num_events     = 0;
+    s->dropped_attrs  = 0;
+    s->dropped_events = 0;
+    s->end_unix_ns    = 0;
+    s->start_unix_ns  = OT.clock();
+    s->flags          = OTEL_FLAG_RECORDING;
+}
+
+SYMBOL_EXPORT void
+otel_span_start(
+    struct otel_span   *s,
+    const char         *name,
+    enum otel_span_kind kind)
+{
+    struct otel_thread_ctx *ctx = otel_tls;
+
+    if (!OT.enabled || !ctx) {
+        s->flags = 0;
+        return;
+    }
+
+    *(uint64_t *) &s->trace_id[0] = otel_rand(ctx);
+    *(uint64_t *) &s->trace_id[8] = otel_rand(ctx);
+    s->span_id   = otel_rand(ctx);
+    s->parent_id = 0;
+    otel_span_init(s, name, kind);
+}
+
+SYMBOL_EXPORT void
+otel_span_start_child(
+    struct otel_span       *s,
+    const char             *name,
+    enum otel_span_kind     kind,
+    const struct otel_span *parent)
+{
+    struct otel_thread_ctx *ctx = otel_tls;
+
+    if (!OT.enabled || !ctx || !parent || !(parent->flags & OTEL_FLAG_RECORDING)) {
+        s->flags = 0;
+        return;
+    }
+
+    memcpy(s->trace_id, parent->trace_id, 16);
+    s->span_id   = otel_rand(ctx);
+    s->parent_id = parent->span_id;
+    otel_span_init(s, name, kind);
+}
+
+SYMBOL_EXPORT void
+otel_span_start_remote(
+    struct otel_span   *s,
+    const char         *name,
+    enum otel_span_kind kind,
+    const uint8_t       trace_id[16],
+    uint64_t            parent_id)
+{
+    struct otel_thread_ctx *ctx = otel_tls;
+
+    if (!OT.enabled || !ctx) {
+        s->flags = 0;
+        return;
+    }
+
+    memcpy(s->trace_id, trace_id, 16);
+    s->span_id   = otel_rand(ctx);
+    s->parent_id = parent_id;
+    otel_span_init(s, name, kind);
+}
+
+SYMBOL_EXPORT int
+otel_span_recording(const struct otel_span *s)
+{
+    return (s->flags & OTEL_FLAG_RECORDING) != 0;
+}
+
+static inline struct otel_attr *
+otel_attr_slot(struct otel_span *s, const char *key)
+{
+    struct otel_attr *a;
+
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return NULL;
+    }
+    if (s->num_attrs >= OTEL_SPAN_MAX_ATTRS) {
+        if (s->dropped_attrs < 255) {
+            s->dropped_attrs++;
+        }
+        return NULL;
+    }
+    a = &s->attrs[s->num_attrs++];
+    a->key = key;
+    return a;
+}
+
+SYMBOL_EXPORT void
+otel_span_attr_str(
+    struct otel_span *s,
+    const char       *key,
+    const char       *value)
+{
+    struct otel_attr *a = otel_attr_slot(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_STR;
+        a->v.s  = value;
+    }
+}
+
+SYMBOL_EXPORT void
+otel_span_attr_i64(
+    struct otel_span *s,
+    const char       *key,
+    int64_t           value)
+{
+    struct otel_attr *a = otel_attr_slot(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_I64;
+        a->v.i  = value;
+    }
+}
+
+SYMBOL_EXPORT void
+otel_span_attr_u64(
+    struct otel_span *s,
+    const char       *key,
+    uint64_t          value)
+{
+    struct otel_attr *a = otel_attr_slot(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_U64;
+        a->v.u  = value;
+    }
+}
+
+SYMBOL_EXPORT void
+otel_span_attr_bool(
+    struct otel_span *s,
+    const char       *key,
+    int               value)
+{
+    struct otel_attr *a = otel_attr_slot(s, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_BOOL;
+        a->v.b  = value ? 1 : 0;
+    }
+}
+
+SYMBOL_EXPORT void
+otel_span_event(
+    struct otel_span *s,
+    const char       *name)
+{
+    struct otel_event *e;
+
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return;
+    }
+    if (s->num_events >= OTEL_SPAN_MAX_EVENTS) {
+        if (s->dropped_events < 255) {
+            s->dropped_events++;
+        }
+        return;
+    }
+    e = &s->events[s->num_events++];
+    e->name         = name;
+    e->time_unix_ns = OT.clock();
+}
+
+SYMBOL_EXPORT void
+otel_span_set_status(
+    struct otel_span *s,
+    enum otel_status  status,
+    const char       *message)
+{
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return;
+    }
+    s->status         = (uint8_t) status;
+    s->status_message = message;
+}
+
+SYMBOL_EXPORT void
+otel_span_end(struct otel_span *s)
+{
+    struct otel_thread_ctx *ctx = otel_tls;
+    uint64_t                head, tail;
+
+    if (!(s->flags & OTEL_FLAG_RECORDING)) {
+        return;
+    }
+
+    s->end_unix_ns = OT.clock();
+
+    if (!ctx) {
+        atomic_fetch_add_explicit(&OT.dropped_spans, 1, memory_order_relaxed);
+        return;
+    }
+
+    /* SPSC enqueue: we are the sole producer. */
+    head = atomic_load_explicit(&ctx->head, memory_order_relaxed);
+    tail = atomic_load_explicit(&ctx->tail, memory_order_acquire);
+
+    if (head - tail >= OTEL_RING_SIZE) {
+        atomic_fetch_add_explicit(&ctx->dropped, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&OT.dropped_spans, 1, memory_order_relaxed);
+        return;
+    }
+
+    ctx->ring[head & (OTEL_RING_SIZE - 1)] = *s;
+    atomic_store_explicit(&ctx->head, head + 1, memory_order_release);
+}
+
+/* ---- drain / OTLP encoding (single consumer) ---- */
+
+static Opentelemetry__Proto__Trace__V1__Span__SpanKind
+otlp_kind(uint8_t kind)
+{
+    switch (kind) {
+        case OTEL_SPAN_SERVER:   return OTLP_KIND_SERVER;
+        case OTEL_SPAN_CLIENT:   return OTLP_KIND_CLIENT;
+        case OTEL_SPAN_PRODUCER: return OTLP_KIND_PRODUCER;
+        case OTEL_SPAN_CONSUMER: return OTLP_KIND_CONSUMER;
+        default:                 return OTLP_KIND_INTERNAL;
+    } /* switch */
+} /* otlp_kind */
+
+/* Forward decl: pack the current batch and push it through the transport. */
+static void otlp_flush(void);
+
+/* Map one finished span into the protobuf-c batch, flushing first if full. */
+static void
+otlp_add_span(const struct otel_span *s)
+{
+    struct otel_otlp *o = &OT.otlp;
+    otlp_span_t      *span;
+    size_t            i;
+
+    if (o->sspans.n_spans == OTEL_BATCH_SPANS ||
+        o->num_attrs + s->num_attrs > OTEL_BATCH_ATTRS ||
+        o->num_events + s->num_events > OTEL_BATCH_EVENTS) {
+        otlp_flush();
+    }
+
+    span = &o->spans[o->sspans.n_spans];
+
+    /* IDs.  The id bytes are opaque to the collector; we ship them raw. */
+    span->trace_id.data = (uint8_t *) s->trace_id;
+    span->trace_id.len  = 16;
+    span->span_id.data  = (uint8_t *) &s->span_id;
+    span->span_id.len   = 8;
+    if (s->parent_id) {
+        span->parent_span_id.data = (uint8_t *) &s->parent_id;
+        span->parent_span_id.len  = 8;
+    } else {
+        span->parent_span_id.data = NULL;
+        span->parent_span_id.len  = 0;
+    }
+
+    span->name                = (char *) (s->name ? s->name : "");
+    span->kind                = otlp_kind(s->kind);
+    span->start_time_unix_nano = s->start_unix_ns;
+    span->end_time_unix_nano   = s->end_unix_ns;
+
+    span->status->code    = (s->status == OTEL_STATUS_ERROR) ? OTLP_STATUS_ERROR :
+                            (s->status == OTEL_STATUS_OK)    ? OTLP_STATUS_OK :
+                            OTLP_STATUS_UNSET;
+    span->status->message = (char *) (s->status_message ? s->status_message : "");
+
+    span->dropped_attributes_count = s->dropped_attrs;
+    span->dropped_events_count     = s->dropped_events;
+
+    /* Attributes: carve a slice from the shared attr pool. */
+    span->attributes  = &o->attrp[o->num_attrs];
+    span->n_attributes = s->num_attrs;
+    for (i = 0; i < s->num_attrs; i++) {
+        const struct otel_attr *sa = &s->attrs[i];
+        otlp_kv_t              *kv = o->attrp[o->num_attrs];
+        otlp_any_t             *av = kv->value;
+
+        kv->key = (char *) sa->key;
+        switch (sa->type) {
+            case OTEL_ATTR_STR:
+                av->value_case   = OTLP_ANY_STR;
+                av->string_value = (char *) (sa->v.s ? sa->v.s : "");
+                break;
+            case OTEL_ATTR_I64:
+                av->value_case = OTLP_ANY_INT;
+                av->int_value  = sa->v.i;
+                break;
+            case OTEL_ATTR_U64:
+                av->value_case = OTLP_ANY_INT;
+                av->int_value  = (int64_t) sa->v.u;
+                break;
+            case OTEL_ATTR_F64:
+                av->value_case   = OTLP_ANY_DBL;
+                av->double_value = sa->v.d;
+                break;
+            case OTEL_ATTR_BOOL:
+                av->value_case = OTLP_ANY_BOOL;
+                av->bool_value = sa->v.b;
+                break;
+            default:
+                av->value_case   = OTLP_ANY_STR;
+                av->string_value = "";
+                break;
+        } /* switch */
+        o->num_attrs++;
+    }
+
+    /* Events: carve a slice from the shared event pool. */
+    span->events  = &o->eventp[o->num_events];
+    span->n_events = s->num_events;
+    for (i = 0; i < s->num_events; i++) {
+        otlp_event_t *ev = o->eventp[o->num_events];
+
+        ev->time_unix_nano = s->events[i].time_unix_ns;
+        ev->name           = (char *) (s->events[i].name ? s->events[i].name : "");
+        ev->n_attributes   = 0;
+        o->num_events++;
+    }
+
+    o->sspans.n_spans++;
+} /* otlp_add_span */
+
+static void
+otlp_flush(void)
+{
+    struct otel_otlp *o = &OT.otlp;
+    struct grpc_hdr  *hdr;
+    size_t            len;
+
+    if (o->sspans.n_spans == 0) {
+        return;
+    }
+
+    hdr = (struct grpc_hdr *) o->buf;
+    len = opentelemetry__proto__collector__trace__v1__export_trace_service_request__pack(
+        &o->request, o->buf + sizeof(*hdr));
+
+    hdr->compressed = 0;
+    hdr->length     = htonl((uint32_t) len);
+
+    if (OT.transport) {
+        OT.transport(o->buf, sizeof(*hdr) + len, OT.transport_priv);
+    }
+
+    /* Reset batch cursors for the next fill. */
+    o->sspans.n_spans = 0;
+    o->num_attrs      = 0;
+    o->num_events     = 0;
+} /* otlp_flush */
+
+static int
+otel_drain_ctx(struct otel_thread_ctx *ctx)
+{
+    uint64_t tail, head;
+    int      n = 0;
+
+    /* SPSC dequeue: we are the sole consumer. */
+    tail = atomic_load_explicit(&ctx->tail, memory_order_relaxed);
+    head = atomic_load_explicit(&ctx->head, memory_order_acquire);
+
+    for (; tail != head; tail++) {
+        otlp_add_span(&ctx->ring[tail & (OTEL_RING_SIZE - 1)]);
+        n++;
+    }
+
+    atomic_store_explicit(&ctx->tail, tail, memory_order_release);
+    return n;
+}
+
+SYMBOL_EXPORT int
+otel_drain(void)
+{
+    struct otel_thread_ctx *ctx;
+    int                     n = 0;
+
+    if (!OT.enabled) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&OT.drain_lock);
+    pthread_rwlock_rdlock(&OT.registry_lock);
+
+    for (ctx = OT.threads; ctx; ctx = ctx->next) {
+        n += otel_drain_ctx(ctx);
+    }
+
+    otlp_flush();
+
+    pthread_rwlock_unlock(&OT.registry_lock);
+    pthread_mutex_unlock(&OT.drain_lock);
+    return n;
+}
+
+SYMBOL_EXPORT uint64_t
+otel_dropped_spans(void)
+{
+    return atomic_load_explicit(&OT.dropped_spans, memory_order_relaxed);
+}
