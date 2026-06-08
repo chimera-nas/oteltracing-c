@@ -65,3 +65,10 @@ target_include_directories(oteltracing_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(oteltracing_test oteltracing-c ${PROTOBUF_C_LIB})
 add_test(NAME oteltracing_test COMMAND oteltracing_test)
+
+# Compile-time-disabled build (OTEL_TRACING=0 set in the source).  Deliberately
+# NOT linked against oteltracing-c: it must build and run with the header alone,
+# proving the API strips to no library dependency.
+add_executable(otel_disabled_test test/otel_disabled_test.c)
+target_include_directories(otel_disabled_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME otel_disabled_test COMMAND otel_disabled_test)

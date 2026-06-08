@@ -149,6 +149,24 @@ for (;;) {
 }
 ```
 
+### Enabling and disabling
+
+Tracing can be turned off two ways:
+
+**At compile time** — define `OTEL_TRACING=0` (e.g. `-DOTEL_TRACING=0`, or
+`#define OTEL_TRACING 0` before including the header). The entire API collapses
+to nothing through the header: `struct otel_span` becomes **zero-size** (the
+member you embed costs nothing) and every `otel_*` call is a no-op the compiler
+elides. No symbol from the library is referenced, so you don't even need to link
+`liboteltracing-c`. Use this to ship builds with tracing wholly removed.
+
+**At runtime** — `otel_set_enabled(int on)`. Tracing is live only when a
+transport is registered *and* enabled (default on). Disabling stops new traces
+from being recorded immediately: the inline hot path just tests a global and
+returns, so the cost is a predictable-branch load with no library call. Spans
+already recording finish normally; re-enabling resumes new traces. This is the
+knob to wire to a config reload or admin command.
+
 ### Sampling
 
 By default every trace is recorded. To sample probabilistically, set a ratio in
@@ -182,6 +200,7 @@ otel_shutdown();                      /* drains remaining spans, frees state */
 | `otel_thread_register()` / `otel_thread_unregister()` | Per-thread span staging (for threads that start/end spans). |
 | `otel_set_transport(fn, priv)` | Register the callback that ships gRPC-framed OTLP buffers. |
 | `otel_set_sampler(ratio)` | Probability `[0,1]` that a new trace is recorded (default 1.0). |
+| `otel_set_enabled(on)` | Runtime on/off switch (default on); `OTEL_TRACING=0` strips at compile time. |
 | `otel_set_clock(now_unix_ns)` | Override the wall-clock source (returns ns since the Unix epoch). |
 | `otel_drain()` | Encode and export finished spans (single consumer). |
 | `otel_dropped_spans()` | Count of spans dropped due to ring overflow. |

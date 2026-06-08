@@ -197,6 +197,21 @@ main(void)
 
     otel_set_sampler(1.0);
 
+    /* ---- runtime enable/disable ---- */
+    otel_set_enabled(0);
+    struct otel_span sd;
+    otel_span_start(&sd, "disabled", OTEL_SPAN_INTERNAL);
+    CHECK(!otel_span_recording(&sd));            /* new traces not recorded */
+    otel_span_end(&sd);
+    CHECK(otel_drain() == 0);
+
+    otel_set_enabled(1);
+    struct otel_span se;
+    otel_span_start(&se, "reenabled", OTEL_SPAN_INTERNAL);
+    CHECK(otel_span_recording(&se));
+    otel_span_end(&se);
+    CHECK(otel_drain() == 1);
+
     otel_thread_unregister();
     otel_shutdown();
 

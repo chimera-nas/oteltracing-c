@@ -27,6 +27,10 @@
 #include <arpa/inet.h>
 #include <uuid/uuid.h>
 
+/* The library implementation always needs the full definitions, regardless of
+ * any -DOTEL_TRACING=0 in the surrounding build. */
+#undef OTEL_TRACING
+#define OTEL_TRACING 1
 #include "oteltracing.h"
 
 #include "stopwatch.h"
@@ -144,6 +148,11 @@ static struct {
     int                       sample_always;
     uint64_t                  sample_threshold;
 
+    /* Runtime enable: otel_enabled_ == initialized && transport_present &&
+     * runtime_on.  runtime_on is the otel_set_enabled() knob (default 1). */
+    int                       transport_present;
+    int                       runtime_on;
+
     pthread_rwlock_t          registry_lock;  /* guards the thread-ctx list */
     struct otel_thread_ctx   *threads;
 
@@ -238,6 +247,10 @@ otel_init(const char *service)
     /* Default: sample every trace.  Override with otel_set_sampler(). */
     OT.sample_always    = 1;
     OT.sample_threshold = ~0ULL;
+
+    /* Enabled at runtime by default; goes live once a transport is registered. */
+    OT.runtime_on       = 1;
+    OT.transport_present = 0;
     otel_enabled_       = 0;
 
     pthread_rwlock_init(&OT.registry_lock, NULL);
@@ -309,14 +322,29 @@ otel_init(const char *service)
     return o->buf ? 0 : -1;
 }
 
+/* Recompute the inline-visible live flag from its inputs. */
+static void
+otel_recompute_enabled(void)
+{
+    otel_enabled_ = OT.initialized && OT.transport_present && OT.runtime_on;
+}
+
 SYMBOL_EXPORT void
 otel_set_transport(
     otel_transport_fn fn,
     void             *priv)
 {
-    OT.transport      = fn;
-    OT.transport_priv = priv;
-    otel_enabled_     = (OT.initialized && fn != NULL);
+    OT.transport         = fn;
+    OT.transport_priv    = priv;
+    OT.transport_present  = (fn != NULL);
+    otel_recompute_enabled();
+}
+
+SYMBOL_EXPORT void
+otel_set_enabled(int enabled)
+{
+    OT.runtime_on = enabled ? 1 : 0;
+    otel_recompute_enabled();
 }
 
 SYMBOL_EXPORT void

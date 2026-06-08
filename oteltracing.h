@@ -37,6 +37,16 @@
 extern "C" {
 #endif
 
+/*
+ * Compile-time master switch.  Define OTEL_TRACING=0 (e.g. -DOTEL_TRACING=0) to
+ * strip tracing entirely from a translation unit: struct otel_span becomes
+ * zero-size and every API call below compiles to nothing, with no link
+ * dependency on liboteltracing-c.  Defaults to enabled.
+ */
+#ifndef OTEL_TRACING
+#define OTEL_TRACING 1
+#endif
+
 /* Maximum attributes/events stored inline in a span.  Overflow beyond these is
  * dropped and counted (see otel_dropped_*).  Kept small because these structs
  * are embedded in pooled, numerous request objects. */
@@ -70,6 +80,8 @@ enum otel_status {
 
 /* Per-span flags. */
 #define OTEL_FLAG_RECORDING 0x01  /* span is sampled and will be emitted */
+
+#if OTEL_TRACING
 
 struct otel_attr {
     const char         *key;   /* borrowed; must outlive otel_drain() */
@@ -153,6 +165,15 @@ void otel_set_transport(otel_transport_fn fn, void *priv);
  * startup; treat as configuration, not a per-request knob.
  */
 void otel_set_sampler(double ratio);
+
+/*
+ * Runtime master switch.  Tracing is live only when a transport is registered
+ * AND enabled here (default on).  Disabling stops new traces from being recorded
+ * immediately and cheaply -- the inline hot path just tests a global and bails;
+ * in-flight spans already recording still complete.  Re-enabling resumes new
+ * traces.  Use this for a runtime on/off knob without rebuilding.
+ */
+void otel_set_enabled(int enabled);
 
 /* Override the wall-clock source (default clock_gettime(CLOCK_REALTIME)).  Lets
  * the embedder inject a TSC-backed clock.  Must return nanoseconds since the
@@ -336,6 +357,63 @@ otel_span_end(struct otel_span *s)
     }
     otel_span_end_(s);   /* slow path: stamps end time, stages for export */
 }
+
+#else  /* OTEL_TRACING == 0 : tracing compiled out */
+
+/*
+ * Tracing is disabled at compile time.  struct otel_span is zero-size so the
+ * member you embed costs nothing, and every API call is a no-op the compiler
+ * elides.  No symbol from liboteltracing-c is referenced, so the library need
+ * not be linked.
+ */
+struct otel_span { };
+
+typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
+
+static inline int  otel_init(const char *service) { (void) service; return 0; }
+static inline void otel_shutdown(void) { }
+static inline void otel_thread_register(void) { }
+static inline void otel_thread_unregister(void) { }
+static inline void otel_set_transport(otel_transport_fn fn, void *priv) { (void) fn; (void) priv; }
+static inline void otel_set_sampler(double ratio) { (void) ratio; }
+static inline void otel_set_enabled(int enabled) { (void) enabled; }
+static inline void otel_set_clock(uint64_t (*now_unix_ns)(void)) { (void) now_unix_ns; }
+static inline int  otel_drain(void) { return 0; }
+static inline uint64_t otel_dropped_spans(void) { return 0; }
+
+static inline void
+otel_span_start(struct otel_span *s, const char *name, enum otel_span_kind kind)
+{ (void) s; (void) name; (void) kind; }
+
+static inline void
+otel_span_start_child(struct otel_span *s, const char *name,
+                      enum otel_span_kind kind, const struct otel_span *parent)
+{ (void) s; (void) name; (void) kind; (void) parent; }
+
+static inline void
+otel_span_start_remote(struct otel_span *s, const char *name,
+                       enum otel_span_kind kind,
+                       const uint8_t trace_id[16], uint64_t parent_id, int sampled)
+{ (void) s; (void) name; (void) kind; (void) trace_id; (void) parent_id; (void) sampled; }
+
+static inline int  otel_span_recording(const struct otel_span *s) { (void) s; return 0; }
+
+static inline void otel_span_attr_str(struct otel_span *s, const char *key, const char *value)
+{ (void) s; (void) key; (void) value; }
+static inline void otel_span_attr_i64(struct otel_span *s, const char *key, int64_t value)
+{ (void) s; (void) key; (void) value; }
+static inline void otel_span_attr_u64(struct otel_span *s, const char *key, uint64_t value)
+{ (void) s; (void) key; (void) value; }
+static inline void otel_span_attr_bool(struct otel_span *s, const char *key, int value)
+{ (void) s; (void) key; (void) value; }
+static inline void otel_span_event(struct otel_span *s, const char *name)
+{ (void) s; (void) name; }
+static inline void otel_span_set_status(struct otel_span *s, enum otel_status status,
+                                        const char *message)
+{ (void) s; (void) status; (void) message; }
+static inline void otel_span_end(struct otel_span *s) { (void) s; }
+
+#endif /* OTEL_TRACING */
 
 #ifdef __cplusplus
 }
