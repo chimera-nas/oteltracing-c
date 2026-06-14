@@ -94,7 +94,9 @@ struct grpc_hdr {
 /* Per-thread context: a lock-free SPSC ring of finished spans.  The home thread
  * is the sole producer (head); otel_drain() is the sole consumer (tail). */
 struct otel_thread_ctx {
-    struct otel_span        *ring;       /* OTEL_RING_SIZE slots */
+    struct otel_span        *ring;       /* `capacity` slots */
+    uint32_t                 capacity;   /* ring slots (power of two) */
+    uint32_t                 mask;       /* capacity - 1 */
     _Atomic uint64_t         head;       /* producer cursor */
     _Atomic uint64_t         tail;       /* consumer cursor */
     _Atomic uint64_t         dropped;    /* ring-full drops on this thread */
@@ -141,6 +143,12 @@ static struct {
 
     otel_transport_fn         transport;
     void                     *transport_priv;
+
+    /* Optional span sink (e.g. SQLite): fed raw finished spans during drain,
+     * alongside or instead of the protobuf transport. */
+    const struct otel_span_sink *sink;
+    int                       sink_present;
+
     uint64_t                (*clock)(void);
 
     /* Head sampling: record every root trace when sample_always, else record
@@ -170,6 +178,10 @@ static struct {
 } OT;
 
 static __thread struct otel_thread_ctx *otel_tls;
+
+/* Per-thread ring capacity used when a thread registers; tunable before any
+ * registration via otel_set_ring_capacity().  Power of two. */
+static unsigned int otel_ring_capacity = OTEL_RING_SIZE;
 
 /* Live flag, read inline from the header hot path; set once a transport is
  * registered.  Exported so the inline wrappers in other TUs resolve it. */
@@ -322,11 +334,14 @@ otel_init(const char *service)
     return o->buf ? 0 : -1;
 }
 
-/* Recompute the inline-visible live flag from its inputs. */
+/* Recompute the inline-visible live flag from its inputs.  Tracing is live when
+ * a destination exists -- a transport or a span sink -- and it is enabled. */
 static void
 otel_recompute_enabled(void)
 {
-    otel_enabled_ = OT.initialized && OT.transport_present && OT.runtime_on;
+    otel_enabled_ = OT.initialized &&
+        (OT.transport_present || OT.sink_present) &&
+        OT.runtime_on;
 }
 
 SYMBOL_EXPORT void
@@ -338,6 +353,36 @@ otel_set_transport(
     OT.transport_priv    = priv;
     OT.transport_present  = (fn != NULL);
     otel_recompute_enabled();
+}
+
+SYMBOL_EXPORT void
+otel_set_span_sink(const struct otel_span_sink *sink)
+{
+    OT.sink         = sink;
+    OT.sink_present = (sink != NULL);
+    otel_recompute_enabled();
+}
+
+SYMBOL_EXPORT const char *
+otel_service_name(void)
+{
+    return OT.service;
+}
+
+SYMBOL_EXPORT void
+otel_set_ring_capacity(unsigned int spans)
+{
+    /* Round up to a power of two (mask arithmetic requires it); clamp to a sane
+     * minimum.  Threads registered after this use the new capacity. */
+    unsigned int cap = 1;
+
+    if (spans < 2) {
+        spans = 2;
+    }
+    while (cap < spans) {
+        cap <<= 1;
+    }
+    otel_ring_capacity = cap;
 }
 
 SYMBOL_EXPORT void
@@ -357,7 +402,9 @@ otel_thread_register(void)
     }
 
     ctx = calloc(1, sizeof(*ctx));
-    ctx->ring = calloc(OTEL_RING_SIZE, sizeof(struct otel_span));
+    ctx->capacity = otel_ring_capacity;
+    ctx->mask     = ctx->capacity - 1;
+    ctx->ring     = calloc(ctx->capacity, sizeof(struct otel_span));
     atomic_store_explicit(&ctx->head, 0, memory_order_relaxed);
     atomic_store_explicit(&ctx->tail, 0, memory_order_relaxed);
 
@@ -377,7 +424,8 @@ otel_thread_register(void)
 
 /* Drain a single context's ring into the batch / transport.  Caller holds
  * OT.drain_lock.  Defined below otlp_add_span. */
-static int otel_drain_ctx(struct otel_thread_ctx *ctx);
+static int  otel_drain_ctx(struct otel_thread_ctx *ctx);
+static void otlp_flush(void);
 
 SYMBOL_EXPORT void
 otel_thread_unregister(void)
@@ -395,7 +443,14 @@ otel_thread_unregister(void)
 
     if (otel_enabled_) {
         pthread_mutex_lock(&OT.drain_lock);
+        if (OT.sink_present && OT.sink->begin) {
+            OT.sink->begin(OT.sink->priv);
+        }
         otel_drain_ctx(ctx);
+        otlp_flush();
+        if (OT.sink_present && OT.sink->end) {
+            OT.sink->end(OT.sink->priv);
+        }
         pthread_mutex_unlock(&OT.drain_lock);
     }
 
@@ -570,13 +625,13 @@ otel_span_end_(struct otel_span *s)
     head = atomic_load_explicit(&ctx->head, memory_order_relaxed);
     tail = atomic_load_explicit(&ctx->tail, memory_order_acquire);
 
-    if (head - tail >= OTEL_RING_SIZE) {
+    if (head - tail >= ctx->capacity) {
         atomic_fetch_add_explicit(&ctx->dropped, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&OT.dropped_spans, 1, memory_order_relaxed);
         return;
     }
 
-    ctx->ring[head & (OTEL_RING_SIZE - 1)] = *s;
+    ctx->ring[head & ctx->mask] = *s;
     atomic_store_explicit(&ctx->head, head + 1, memory_order_release);
 }
 
@@ -593,9 +648,6 @@ otlp_kind(uint8_t kind)
         default:                 return OTLP_KIND_INTERNAL;
     } /* switch */
 } /* otlp_kind */
-
-/* Forward decl: pack the current batch and push it through the transport. */
-static void otlp_flush(void);
 
 /* Map one finished span into the protobuf-c batch, flushing first if full. */
 static void
@@ -720,6 +772,19 @@ otlp_flush(void)
     o->num_events     = 0;
 } /* otlp_flush */
 
+/* Emit one finished span to every registered consumer: the protobuf transport
+ * batch (if a transport is set) and the raw-span sink (if one is set). */
+static void
+otel_emit_span(const struct otel_span *s)
+{
+    if (OT.transport_present) {
+        otlp_add_span(s);
+    }
+    if (OT.sink_present && OT.sink->span) {
+        OT.sink->span(s, OT.sink->priv);
+    }
+}
+
 static int
 otel_drain_ctx(struct otel_thread_ctx *ctx)
 {
@@ -731,7 +796,7 @@ otel_drain_ctx(struct otel_thread_ctx *ctx)
     head = atomic_load_explicit(&ctx->head, memory_order_acquire);
 
     for (; tail != head; tail++) {
-        otlp_add_span(&ctx->ring[tail & (OTEL_RING_SIZE - 1)]);
+        otel_emit_span(&ctx->ring[tail & ctx->mask]);
         n++;
     }
 
@@ -752,11 +817,19 @@ otel_drain(void)
     pthread_mutex_lock(&OT.drain_lock);
     pthread_rwlock_rdlock(&OT.registry_lock);
 
+    if (OT.sink_present && OT.sink->begin) {
+        OT.sink->begin(OT.sink->priv);
+    }
+
     for (ctx = OT.threads; ctx; ctx = ctx->next) {
         n += otel_drain_ctx(ctx);
     }
 
     otlp_flush();
+
+    if (OT.sink_present && OT.sink->end) {
+        OT.sink->end(OT.sink->priv);
+    }
 
     pthread_rwlock_unlock(&OT.registry_lock);
     pthread_mutex_unlock(&OT.drain_lock);

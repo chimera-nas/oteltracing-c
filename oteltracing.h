@@ -156,6 +156,46 @@ typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
 void otel_set_transport(otel_transport_fn fn, void *priv);
 
 /*
+ * Span sink: an alternative (or additional) consumer fed the raw finished spans
+ * during otel_drain(), instead of (or alongside) the gRPC transport.  Unlike the
+ * transport -- which receives an already-encoded protobuf buffer -- a sink sees
+ * the native struct otel_span, so a sink (e.g. the optional SQLite backend) can
+ * persist spans without a protobuf round-trip.
+ *
+ * The three callbacks bracket one drain pass: begin() once before any spans of a
+ * drain (open a transaction), span() for each finished span, end() once after
+ * (commit).  All run on the single drain/flusher thread, never on a span's home
+ * (hot-path) thread, so a slow sink can never block span production -- it only
+ * slows draining, which makes the per-thread rings fill and overflowing spans
+ * drop (counted, see otel_dropped_spans).  begin/end may be NULL.
+ *
+ * Borrowed-pointer rules match the transport: a span's name/attr/event strings
+ * are valid only for the duration of the span() call -- copy them if you persist.
+ */
+struct otel_span_sink {
+    void (*begin)(void *priv);
+    void (*span)(const struct otel_span *s, void *priv);
+    void (*end)(void *priv);
+    void  *priv;
+};
+void otel_set_span_sink(const struct otel_span_sink *sink);   /* NULL detaches */
+
+/* The configured OTLP service.name (set via otel_init).  Useful to a span sink
+ * that wants to denormalize the service onto each stored span. */
+const char *otel_service_name(void);
+
+/*
+ * Per-thread ring capacity (finished-span backlog) in spans; must be a power of
+ * two.  This is the buffer between the lock-free span hot path (producer) and the
+ * drain/flusher (consumer): when it fills -- e.g. the sink can't keep up -- newly
+ * ended spans are dropped and counted rather than blocking the producer.  Larger
+ * capacity absorbs longer sink-latency spikes at the cost of memory per thread.
+ * Takes effect for threads registered after the call; set it before
+ * otel_thread_register().  Default OTEL_RING_SIZE (2048).
+ */
+void otel_set_ring_capacity(unsigned int spans);
+
+/*
  * Head-sampling ratio in [0,1]: the probability that a newly started (root)
  * trace is recorded.  1.0 (the default) records every trace; 0.0 records none;
  * 0.01 records roughly 1 in 100.  The decision is made once, when a root span
@@ -370,11 +410,21 @@ struct otel_span { };
 
 typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
 
+struct otel_span_sink {
+    void (*begin)(void *priv);
+    void (*span)(const struct otel_span *s, void *priv);
+    void (*end)(void *priv);
+    void  *priv;
+};
+
 static inline int  otel_init(const char *service) { (void) service; return 0; }
 static inline void otel_shutdown(void) { }
 static inline void otel_thread_register(void) { }
 static inline void otel_thread_unregister(void) { }
 static inline void otel_set_transport(otel_transport_fn fn, void *priv) { (void) fn; (void) priv; }
+static inline void otel_set_span_sink(const struct otel_span_sink *sink) { (void) sink; }
+static inline const char *otel_service_name(void) { return ""; }
+static inline void otel_set_ring_capacity(unsigned int spans) { (void) spans; }
 static inline void otel_set_sampler(double ratio) { (void) ratio; }
 static inline void otel_set_enabled(int enabled) { (void) enabled; }
 static inline void otel_set_clock(uint64_t (*now_unix_ns)(void)) { (void) now_unix_ns; }

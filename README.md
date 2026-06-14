@@ -50,6 +50,9 @@ Dependencies:
   `protobuf-c-compiler`) — used to generate the OTLP bindings.
 - `libuuid` (`uuid-dev`) — for seeding trace/span IDs.
 - `pthread`.
+- `libsqlite3` (`libsqlite3-dev`) — **optional**, enables the local SQLite span
+  store and the `otel-trace` CLI (see below). Auto-detected; toggle with
+  `-DOTEL_SQLITE=ON/OFF`. The core library never depends on it.
 
 The [`stopwatch`](https://github.com/chimera-nas/stopwatch) submodule is vendored
 under `ext/stopwatch`, so clone recursively:
@@ -191,6 +194,78 @@ otel_thread_unregister();             /* on each registered thread */
 otel_shutdown();                      /* drains remaining spans, frees state */
 ```
 
+## Local span store (SQLite) + the `otel-trace` CLI
+
+For local debugging you often don't want to stand up an OTLP collector. The
+optional SQLite sink persists spans to a database file you can interrogate
+offline with the bundled `otel-trace` tool. It is an alternative (or addition)
+to the gRPC transport — you can run either, both, or neither.
+
+It is built whenever `libsqlite3` is found (toggle with `-DOTEL_SQLITE=ON/OFF`);
+the core library never depends on SQLite.
+
+```c
+#include "oteltracing.h"
+#include "otel_sqlite.h"
+
+otel_init("my-service");
+otel_sqlite_open("/tmp/traces.db", 0);   /* 0 = default flush cadence */
+/* ... otel_thread_register() and produce spans as usual ... */
+otel_sqlite_close();                     /* flush + close before otel_shutdown() */
+otel_shutdown();
+```
+
+`otel_sqlite_open()` registers a span sink and spawns **one dedicated flusher
+thread** that owns the database handle. All SQLite work happens on that thread,
+never on a span's hot path: producing a span only ever enqueues into a per-thread
+lock-free ring. The database is opened in WAL mode and tuned for large batched
+writes from a single writer — each drain is committed as one transaction — so the
+`otel-trace` CLI can read a file a live process is still writing to.
+
+### Backpressure and dropping
+
+The ring between the span hot path and the flusher is the backpressure valve. If
+the flusher (or SQLite) can't keep up, the ring fills and newly ended spans are
+**dropped and counted** (`otel_dropped_spans()`) rather than ever blocking the
+producer. Size the backlog before registering threads:
+
+```c
+otel_set_ring_capacity(8192);   /* per-thread span backlog (power of two) */
+```
+
+Optional retention caps the file size by pruning the oldest traces:
+
+```c
+otel_sqlite_set_max_spans(1000000);   /* 0 (default) = unlimited */
+```
+
+Head sampling (`otel_set_sampler`) remains the primary volume control.
+
+### Querying with `otel-trace`
+
+```sh
+otel-trace --db /tmp/traces.db list                    # recent traces
+otel-trace --db /tmp/traces.db show <trace_id>         # full span tree
+otel-trace --db /tmp/traces.db spans --status error    # individual spans
+otel-trace --db /tmp/traces.db stats                   # per-name latency
+otel-trace --db /tmp/traces.db sql "<query>"           # raw read-only SQL
+```
+
+Filters for `list`/`spans`: `--service`, `--name`, `--status error`, `--since
+SECONDS`, `--min-duration-us`, `--limit`. The DB path also comes from
+`$OTEL_TRACE_DB` (default `./traces.db`). `show` reconstructs the parent/child
+tree with per-span durations and offsets, attributes, and events:
+
+```
+trace 67b40cfb57e2d369da08ed33e8b5940e  (2 spans)
+parent-op [server] 451ns (+0ns)
+  - peer = "1.2.3.4"
+  - bytes = 4096
+  * event: received
+  child-op [internal] 90ns (+311ns)  status=ERROR: boom
+    - depth = 1
+```
+
 ## API reference
 
 | Function | Purpose |
@@ -199,6 +274,8 @@ otel_shutdown();                      /* drains remaining spans, frees state */
 | `otel_shutdown()` | Drain and tear down. |
 | `otel_thread_register()` / `otel_thread_unregister()` | Per-thread span staging (for threads that start/end spans). |
 | `otel_set_transport(fn, priv)` | Register the callback that ships gRPC-framed OTLP buffers. |
+| `otel_set_span_sink(sink)` | Register a raw-span consumer (e.g. the SQLite sink); runs alongside or instead of the transport. |
+| `otel_set_ring_capacity(spans)` | Per-thread finished-span backlog before drops (power of two; set before registering threads). |
 | `otel_set_sampler(ratio)` | Probability `[0,1]` that a new trace is recorded (default 1.0). |
 | `otel_set_enabled(on)` | Runtime on/off switch (default on); `OTEL_TRACING=0` strips at compile time. |
 | `otel_set_clock(now_unix_ns)` | Override the wall-clock source (returns ns since the Unix epoch). |
