@@ -92,7 +92,9 @@ main(void)
     CHECK(otel_span_recording(&parent));
     otel_span_attr_str(&parent, "peer", "1.2.3.4");
     otel_span_attr_u64(&parent, "bytes", 4096);
-    otel_span_event(&parent, "received");
+    struct otel_event *ev = otel_span_event(&parent, "received");
+    otel_event_attr_str(&parent, ev, "queue", "rx0");
+    otel_event_attr_u64(&parent, ev, "len", 512);
 
     otel_span_start_child(&child, "child-op", OTEL_SPAN_INTERNAL, &parent);
     otel_span_attr_i64(&child, "depth", 1);
@@ -138,6 +140,19 @@ main(void)
         "SELECT e.name FROM span_events e JOIN spans s ON e.span=s.id "
         "WHERE s.name='parent-op'", buf, sizeof(buf));
     CHECK(strcmp(buf, "received") == 0);
+
+    /* The event carries its own two attributes (string + int). */
+    CHECK(scalar_i64(db,
+        "SELECT COUNT(*) FROM span_event_attrs ea "
+        "JOIN span_events e ON ea.event=e.id "
+        "JOIN spans s ON e.span=s.id WHERE s.name='parent-op'") == 2);
+    scalar_text(db,
+        "SELECT ea.s_val FROM span_event_attrs ea "
+        "JOIN span_events e ON ea.event=e.id "
+        "WHERE ea.key='queue'", buf, sizeof(buf));
+    CHECK(strcmp(buf, "rx0") == 0);
+    CHECK(scalar_i64(db,
+        "SELECT ea.i_val FROM span_event_attrs ea WHERE ea.key='len'") == 512);
 
     /* String attr value round-trips. */
     scalar_text(db,

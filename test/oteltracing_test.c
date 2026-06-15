@@ -66,7 +66,9 @@ main(void)
     CHECK(otel_span_recording(&parent));
     otel_span_attr_str(&parent, "peer", "1.2.3.4");
     otel_span_attr_u64(&parent, "bytes", 4096);
-    otel_span_event(&parent, "received");
+    struct otel_event *ev = otel_span_event(&parent, "received");
+    otel_event_attr_str(&parent, ev, "queue", "rx0");
+    otel_event_attr_u64(&parent, ev, "len", 512);
 
     otel_span_start_child(&child, "child-op", OTEL_SPAN_INTERNAL, &parent);
     otel_span_attr_i64(&child, "depth", 1);
@@ -141,10 +143,25 @@ main(void)
             CHECK(sp_parent->start_time_unix_nano > 0);
             CHECK(sp_parent->end_time_unix_nano >= sp_parent->start_time_unix_nano);
 
-            /* Parent attributes + event. */
+            /* Parent attributes + event (with its own attributes). */
             CHECK(sp_parent->n_attributes == 2);
             CHECK(sp_parent->n_events == 1);
             CHECK(strcmp(sp_parent->events[0]->name, "received") == 0);
+            CHECK(sp_parent->events[0]->n_attributes == 2);
+            {
+                int found_queue = 0, found_len = 0;
+                for (size_t i = 0; i < sp_parent->events[0]->n_attributes; i++) {
+                    Opentelemetry__Proto__Common__V1__KeyValue *kv =
+                        sp_parent->events[0]->attributes[i];
+                    if (strcmp(kv->key, "queue") == 0) {
+                        found_queue = (strcmp(kv->value->string_value, "rx0") == 0);
+                    } else if (strcmp(kv->key, "len") == 0) {
+                        found_len = (kv->value->int_value == 512);
+                    }
+                }
+                CHECK(found_queue);
+                CHECK(found_len);
+            }
 
             /* Child status + attr. */
             CHECK(sp_child->n_attributes == 1);
@@ -259,6 +276,49 @@ main(void)
             CHECK(found_five);
             opentelemetry__proto__collector__trace__v1__export_trace_service_request__free_unpacked(
                 mreq, NULL);
+        }
+    }
+
+    /* ---- shared arena: attrs and events have no fixed per-kind cap; they share
+     * one byte budget with the strings.  Add far more of each than the old inline
+     * arrays (8 attrs / 4 events) held, and confirm they all round-trip. ---- */
+    {
+        const int NA = 40, NE = 20;
+        char      key[32];
+        struct otel_span big;
+
+        otel_span_start(&big, "big-op", OTEL_SPAN_INTERNAL);
+        for (int k = 0; k < NA; k++) {
+            snprintf(key, sizeof(key), "k%d", k);
+            otel_span_attr_i64(&big, key, k);
+        }
+        for (int k = 0; k < NE; k++) {
+            snprintf(key, sizeof(key), "ev%d", k);
+            otel_span_event(&big, key);
+        }
+        otel_span_end(&big);
+
+        g_len = 0;
+        CHECK(otel_drain() == 1);
+
+        struct grpc_hdr *bh = (struct grpc_hdr *) g_buf;
+        Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest *breq =
+            opentelemetry__proto__collector__trace__v1__export_trace_service_request__unpack(
+                NULL, ntohl(bh->length), g_buf + sizeof(*bh));
+        CHECK(breq != NULL);
+        if (breq) {
+            Opentelemetry__Proto__Trace__V1__Span *bsp =
+                breq->resource_spans[0]->scope_spans[0]->spans[0];
+            CHECK(bsp->n_attributes == (size_t) NA);
+            CHECK(bsp->n_events == (size_t) NE);
+            CHECK(bsp->dropped_attributes_count == 0);
+            CHECK(bsp->dropped_events_count == 0);
+            /* Spot-check that values survived in list order. */
+            CHECK(strcmp(bsp->attributes[0]->key, "k0") == 0);
+            CHECK(bsp->attributes[NA - 1]->value->int_value == NA - 1);
+            CHECK(strcmp(bsp->events[NE - 1]->name, "ev19") == 0);
+            opentelemetry__proto__collector__trace__v1__export_trace_service_request__free_unpacked(
+                breq, NULL);
         }
     }
 

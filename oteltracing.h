@@ -48,19 +48,26 @@ extern "C" {
 #define OTEL_TRACING 1
 #endif
 
-/* Maximum attributes/events stored inline in a span.  Overflow beyond these is
- * dropped and counted (see otel_dropped_*).  Kept small because these structs
- * are embedded in pooled, numerous request objects. */
-#define OTEL_SPAN_MAX_ATTRS  8
-#define OTEL_SPAN_MAX_EVENTS 4
-
-/* Inline string arena size, chosen so that the whole struct otel_span is exactly
- * 4 KiB on a 64-bit target (the fixed fields below occupy 336 bytes).  All span
- * strings -- the name, attribute keys and string values, event names, and the
- * status message -- are copied into this arena so the span is self-contained: it
- * borrows no caller memory and can be copied by value.  When the arena fills, a
- * string is simply dropped (its pointer becomes NULL). */
-#define OTEL_SPAN_STRBUF 3760
+/*
+ * A span carries a single inline arena from which everything variable-length is
+ * sub-allocated: the name, the status message, attribute records, event records,
+ * and all of their strings (attr keys, attr string values, event names).  There
+ * are therefore no fixed per-kind caps -- attributes, events and strings simply
+ * share one byte budget, and whatever overflows the arena is dropped and counted
+ * (see otel_dropped_*).  Attributes and events are chained as singly-linked lists
+ * threaded through the arena.
+ *
+ * The arena is addressed by byte OFFSETS (uint16_t) rather than pointers, so a
+ * span is position-independent: it can be copied by value (the tracer memcpy's it
+ * into its export ring) with no pointer fix-up at all.  OTEL_NIL marks an empty
+ * list / absent string.  Allocations are rounded up to OTEL_ARENA_ALIGN bytes so
+ * that records (which contain 64-bit fields) stay naturally aligned.
+ *
+ * OTEL_SPAN_ARENA is chosen so the whole struct otel_span is exactly 4 KiB on a
+ * 64-bit target (the fixed fields below occupy 72 bytes). */
+#define OTEL_SPAN_ARENA   4024
+#define OTEL_ARENA_ALIGN  8
+#define OTEL_NIL          0xFFFF
 
 /* Span kind, mirrors OTLP SpanKind (INTERNAL is the default). */
 enum otel_span_kind {
@@ -92,60 +99,81 @@ enum otel_status {
 
 #if OTEL_TRACING
 
+/*
+ * Attribute record.  Lives in the span arena and is reached through the span's
+ * attr list (see otel_attr_first/next).  All references into the arena are byte
+ * offsets, not pointers, so the span stays copyable by value.  Treat as opaque;
+ * use the otel_attr_* accessors.
+ */
 struct otel_attr {
-    const char         *key;   /* into the span's strbuf (or NULL) */
-    uint8_t             type;   /* enum otel_attr_type */
-    union {
-        const char *s;         /* into the span's strbuf (or NULL) */
-        int64_t     i;
-        uint64_t    u;
-        double      d;
-        int         b;
+    uint16_t next;             /* arena offset of the next attr, or OTEL_NIL */
+    uint16_t key;              /* arena offset of the key string */
+    uint16_t val;             /* arena offset of the string value (STR), else OTEL_NIL */
+    uint8_t  type;             /* enum otel_attr_type */
+    uint8_t  pad;
+    union {                    /* numeric value (string value lives at `val`) */
+        int64_t  i;
+        uint64_t u;
+        double   d;
+        int      b;
     } v;
 };
 
+/* Event record.  Lives in the span arena; reached through otel_event_first/next.
+ * An event carries its own attribute list (OTLP allows per-event attributes),
+ * built from the same struct otel_attr records and reached via
+ * otel_event_attr_first/otel_attr_next. */
 struct otel_event {
-    const char *name;          /* into the span's strbuf (or NULL) */
-    uint64_t    time_unix_ns;
+    uint16_t next;             /* arena offset of the next event, or OTEL_NIL */
+    uint16_t name;             /* arena offset of the name string */
+    uint16_t attr_head;        /* arena offset of the first event attr, or OTEL_NIL */
+    uint16_t attr_tail;        /* arena offset of the last event attr */
+    uint8_t  num_attrs;
+    uint8_t  dropped_attrs;
+    uint16_t pad;
+    uint64_t time_unix_ns;
 };
 
 /*
  * Embeddable span.  Treat fields as opaque; use the otel_span_* helpers.
  *
- * The span is self-contained: every string (name, attr keys/values, event
- * names, status message) is copied into the inline strbuf arena, and the string
- * pointers point into that arena.  This means a span can be copied by value and
- * borrows no caller memory -- the helpers copy the strings in.  (On enqueue the
- * tracer rebases the arena pointers into the ring slot's own copy.)  The fixed
- * fields total 336 bytes; OTEL_SPAN_STRBUF makes the whole struct exactly 4 KiB.
+ * The span is self-contained and position-independent: the name, status message,
+ * attribute and event records, and every string they reference all live in the
+ * inline `arena` and are addressed by byte offsets into it.  Because nothing
+ * stores a pointer, a span can be copied by value (the tracer memcpy's it into
+ * its ring) with no fix-up.  The fixed fields total 72 bytes; OTEL_SPAN_ARENA
+ * makes the whole struct exactly 4 KiB.
  */
 struct otel_span {
     uint8_t  trace_id[16];
     uint64_t span_id;
     uint64_t parent_id;
-    const char *name;
     uint64_t start_unix_ns;
     uint64_t end_unix_ns;
+    uint16_t name;             /* arena offset of the name, or OTEL_NIL */
+    uint16_t status_message;   /* arena offset of the status message, or OTEL_NIL */
+    uint16_t attr_head;        /* arena offset of the first attr, or OTEL_NIL */
+    uint16_t attr_tail;        /* arena offset of the last attr (O(1) append) */
+    uint16_t event_head;       /* arena offset of the first event, or OTEL_NIL */
+    uint16_t event_tail;       /* arena offset of the last event */
+    uint16_t arena_used;       /* bytes consumed in arena */
+    uint16_t num_attrs;        /* attrs in the list */
+    uint16_t num_events;       /* events in the list */
     uint8_t  kind;             /* enum otel_span_kind */
     uint8_t  flags;            /* OTEL_FLAG_* */
     uint8_t  status;           /* enum otel_status */
-    uint8_t  num_attrs;
-    uint8_t  num_events;
     uint8_t  dropped_attrs;
     uint8_t  dropped_events;
-    uint16_t str_used;         /* bytes consumed in strbuf */
-    const char *status_message;
-    struct otel_attr  attrs[OTEL_SPAN_MAX_ATTRS];
-    struct otel_event events[OTEL_SPAN_MAX_EVENTS];
-    char     strbuf[OTEL_SPAN_STRBUF];
+    uint8_t  pad;
+    char     arena[OTEL_SPAN_ARENA];
 };
 
 #ifdef __cplusplus
 static_assert(sizeof(struct otel_span) == 4096,
-              "otel_span must be 4 KiB; adjust OTEL_SPAN_STRBUF");
+              "otel_span must be 4 KiB; adjust OTEL_SPAN_ARENA");
 #else
 _Static_assert(sizeof(struct otel_span) == 4096,
-               "otel_span must be 4 KiB; adjust OTEL_SPAN_STRBUF");
+               "otel_span must be 4 KiB; adjust OTEL_SPAN_ARENA");
 #endif
 
 /* ---- process / thread lifecycle ---- */
@@ -271,36 +299,134 @@ void otel_span_start_child_(struct otel_span *s, const char *name, uint8_t kind,
                             const struct otel_span *parent);
 void otel_span_start_remote_(struct otel_span *s, const char *name, uint8_t kind,
                              const uint8_t trace_id[16], uint64_t parent_id);
-void otel_span_event_(struct otel_span *s, const char *name);
+struct otel_event *otel_span_event_(struct otel_span *s, const char *name);
 void otel_span_end_(struct otel_span *s);
 
-/* Copy up to `len` bytes of `str` (plus a NUL) into the span's string arena and
- * return a pointer to the copy, or NULL if it does not fit (or str is NULL).
- * Internal helper used by the string-bearing setters. */
-static inline const char *
-otel_strputn(struct otel_span *s, const char *str, size_t len)
+/* Reserve `n` bytes from the span's arena (rounded up to OTEL_ARENA_ALIGN so the
+ * next allocation stays aligned) and return the byte offset, or OTEL_NIL if it
+ * does not fit.  Internal building block for strings and records. */
+static inline uint16_t
+otel_arena_alloc(struct otel_span *s, size_t n)
 {
-    char  *dst;
-    size_t avail;
+    size_t off = ((size_t) s->arena_used + (OTEL_ARENA_ALIGN - 1)) &
+        ~(size_t) (OTEL_ARENA_ALIGN - 1);
+    size_t end = off + ((n + (OTEL_ARENA_ALIGN - 1)) & ~(size_t) (OTEL_ARENA_ALIGN - 1));
+
+    if (end > OTEL_SPAN_ARENA) {
+        return (uint16_t) OTEL_NIL;
+    }
+    s->arena_used = (uint16_t) end;
+    return (uint16_t) off;
+}
+
+/* Copy up to `len` bytes of `str` (plus a NUL) into the span's arena and return
+ * the byte offset of the copy, or OTEL_NIL if it does not fit (or str is NULL). */
+static inline uint16_t
+otel_arena_putn(struct otel_span *s, const char *str, size_t len)
+{
+    uint16_t off;
+    char    *dst;
 
     if (!str) {
-        return (const char *) 0;
+        return (uint16_t) OTEL_NIL;
     }
-    avail = (size_t) OTEL_SPAN_STRBUF - s->str_used;
-    if (len + 1 > avail) {
-        return (const char *) 0;   /* arena full: caller stores NULL */
+    off = otel_arena_alloc(s, len + 1);
+    if (off == (uint16_t) OTEL_NIL) {
+        return (uint16_t) OTEL_NIL;   /* arena full */
     }
-    dst = &s->strbuf[s->str_used];
+    dst = &s->arena[off];
     memcpy(dst, str, len);
-    dst[len]     = '\0';
-    s->str_used += (uint16_t) (len + 1);
-    return dst;
+    dst[len] = '\0';
+    return off;
+}
+
+static inline uint16_t
+otel_arena_put(struct otel_span *s, const char *str)
+{
+    return str ? otel_arena_putn(s, str, strlen(str)) : (uint16_t) OTEL_NIL;
+}
+
+/* ---- read accessors (used by the exporter / a span sink) ----
+ *
+ * Resolve arena offsets back to C strings and walk the attr/event lists.  All
+ * returned pointers point into the span's own arena and are valid for as long as
+ * the span is. */
+static inline const char *
+otel_span_strv(const struct otel_span *s, uint16_t off)
+{
+    return off == (uint16_t) OTEL_NIL ? "" : &s->arena[off];
 }
 
 static inline const char *
-otel_strput(struct otel_span *s, const char *str)
+otel_span_name(const struct otel_span *s)
 {
-    return str ? otel_strputn(s, str, strlen(str)) : (const char *) 0;
+    return otel_span_strv(s, s->name);
+}
+
+static inline const char *
+otel_span_status_message(const struct otel_span *s)
+{
+    return otel_span_strv(s, s->status_message);
+}
+
+static inline const struct otel_attr *
+otel_attr_first(const struct otel_span *s)
+{
+    return s->attr_head == (uint16_t) OTEL_NIL ?
+           (const struct otel_attr *) 0 :
+           (const struct otel_attr *) &s->arena[s->attr_head];
+}
+
+static inline const struct otel_attr *
+otel_attr_next(const struct otel_span *s, const struct otel_attr *a)
+{
+    return a->next == (uint16_t) OTEL_NIL ?
+           (const struct otel_attr *) 0 :
+           (const struct otel_attr *) &s->arena[a->next];
+}
+
+static inline const char *
+otel_attr_key(const struct otel_span *s, const struct otel_attr *a)
+{
+    return otel_span_strv(s, a->key);
+}
+
+static inline const char *
+otel_attr_strval(const struct otel_span *s, const struct otel_attr *a)
+{
+    return otel_span_strv(s, a->val);
+}
+
+static inline const struct otel_event *
+otel_event_first(const struct otel_span *s)
+{
+    return s->event_head == (uint16_t) OTEL_NIL ?
+           (const struct otel_event *) 0 :
+           (const struct otel_event *) &s->arena[s->event_head];
+}
+
+static inline const struct otel_event *
+otel_event_next(const struct otel_span *s, const struct otel_event *e)
+{
+    return e->next == (uint16_t) OTEL_NIL ?
+           (const struct otel_event *) 0 :
+           (const struct otel_event *) &s->arena[e->next];
+}
+
+static inline const char *
+otel_event_name(const struct otel_span *s, const struct otel_event *e)
+{
+    return otel_span_strv(s, e->name);
+}
+
+/* First attribute of an event (walk onward with otel_attr_next; resolve with
+ * otel_attr_key / otel_attr_strval, exactly like span attributes). */
+static inline const struct otel_attr *
+otel_event_attr_first(const struct otel_span *s, const struct otel_event *e)
+{
+    return e->attr_head == (uint16_t) OTEL_NIL ?
+           (const struct otel_attr *) 0 :
+           (const struct otel_attr *) &s->arena[e->attr_head];
 }
 
 /* Start a new root span (begins a fresh trace; sampling is decided here). */
@@ -319,13 +445,13 @@ otel_span_start(struct otel_span *s, const char *name, enum otel_span_kind kind)
 static inline void
 otel_span_set_name(struct otel_span *s, const char *name)
 {
-    const char *n;
+    uint16_t n;
 
     if (!(s->flags & OTEL_FLAG_RECORDING)) {
         return;
     }
-    n = otel_strput(s, name);
-    if (n) {
+    n = otel_arena_put(s, name);
+    if (n != (uint16_t) OTEL_NIL) {
         s->name = n;
     }
 }
@@ -366,33 +492,41 @@ otel_span_recording(const struct otel_span *s)
     return (s->flags & OTEL_FLAG_RECORDING) != 0;
 }
 
-/* Internal: claim the next inline attribute slot, or NULL if not recording, full
- * (dropped + counted), or the key string did not fit in the arena.  The key is
- * copied into the arena. */
+/* Internal: allocate an attribute record from the arena, copy its key in, and
+ * append it to the span's attr list.  Returns the record, or NULL if not
+ * recording or the arena could not fit the key + record (dropped + counted).
+ * The returned record's value field is left for the caller to fill. */
 static inline struct otel_attr *
 otel_span_attr_(struct otel_span *s, const char *key)
 {
     struct otel_attr *a;
-    const char       *k;
+    uint16_t          koff, roff;
 
     if (!(s->flags & OTEL_FLAG_RECORDING)) {
         return (struct otel_attr *) 0;
     }
-    if (s->num_attrs >= OTEL_SPAN_MAX_ATTRS) {
-        if (s->dropped_attrs < 255) {
-            s->dropped_attrs++;
-        }
-        return (struct otel_attr *) 0;
-    }
-    k = otel_strput(s, key);
-    if (!k) {
+    koff = otel_arena_put(s, key);
+    roff = otel_arena_alloc(s, sizeof(struct otel_attr));
+    if (koff == (uint16_t) OTEL_NIL || roff == (uint16_t) OTEL_NIL) {
         if (s->dropped_attrs < 255) {
             s->dropped_attrs++;   /* arena full: drop the whole attr */
         }
         return (struct otel_attr *) 0;
     }
-    a      = &s->attrs[s->num_attrs++];
-    a->key = k;
+
+    a       = (struct otel_attr *) &s->arena[roff];
+    a->next = (uint16_t) OTEL_NIL;
+    a->key  = koff;
+    a->val  = (uint16_t) OTEL_NIL;
+    a->type = OTEL_ATTR_STR;
+
+    if (s->attr_tail == (uint16_t) OTEL_NIL) {
+        s->attr_head = roff;
+    } else {
+        ((struct otel_attr *) &s->arena[s->attr_tail])->next = roff;
+    }
+    s->attr_tail = roff;
+    s->num_attrs++;
     return a;
 }
 
@@ -407,7 +541,7 @@ otel_span_attr_str(struct otel_span *s, const char *key, const char *value)
 
     if (a) {
         a->type = OTEL_ATTR_STR;
-        a->v.s  = otel_strput(s, value);
+        a->val  = otel_arena_put(s, value);
     }
 }
 
@@ -421,7 +555,7 @@ otel_span_attr_strn(struct otel_span *s, const char *key,
 
     if (a) {
         a->type = OTEL_ATTR_STR;
-        a->v.s  = otel_strputn(s, value, len);
+        a->val  = otel_arena_putn(s, value, len);
     }
 }
 
@@ -458,13 +592,118 @@ otel_span_attr_bool(struct otel_span *s, const char *key, int value)
     }
 }
 
-static inline void
+/* Add a timestamped event and return a handle to it, or NULL if the span is not
+ * recording (or the arena was full).  Pass the handle to otel_event_attr_* to
+ * attach per-event attributes; ignore it if the event needs none.  The handle
+ * stays valid until the span ends (the arena never relocates existing records). */
+static inline struct otel_event *
 otel_span_event(struct otel_span *s, const char *name)
 {
     if (!(s->flags & OTEL_FLAG_RECORDING)) {
-        return;
+        return (struct otel_event *) 0;
     }
-    otel_span_event_(s, name);   /* slow path: needs the clock */
+    return otel_span_event_(s, name);   /* slow path: needs the clock */
+}
+
+/* Internal: allocate an attribute record from the arena, copy its key in, and
+ * append it to an EVENT's attr list.  Returns the record (value left to the
+ * caller) or NULL if `e` is NULL or the arena could not fit it (dropped+counted
+ * on the event). */
+static inline struct otel_attr *
+otel_event_attr_(struct otel_span *s, struct otel_event *e, const char *key)
+{
+    struct otel_attr *a;
+    uint16_t          koff, roff;
+
+    if (!e) {
+        return (struct otel_attr *) 0;
+    }
+    koff = otel_arena_put(s, key);
+    roff = otel_arena_alloc(s, sizeof(struct otel_attr));
+    if (koff == (uint16_t) OTEL_NIL || roff == (uint16_t) OTEL_NIL) {
+        if (e->dropped_attrs < 255) {
+            e->dropped_attrs++;
+        }
+        return (struct otel_attr *) 0;
+    }
+
+    a       = (struct otel_attr *) &s->arena[roff];
+    a->next = (uint16_t) OTEL_NIL;
+    a->key  = koff;
+    a->val  = (uint16_t) OTEL_NIL;
+    a->type = OTEL_ATTR_STR;
+
+    if (e->attr_tail == (uint16_t) OTEL_NIL) {
+        e->attr_head = roff;
+    } else {
+        ((struct otel_attr *) &s->arena[e->attr_tail])->next = roff;
+    }
+    e->attr_tail = roff;
+    e->num_attrs++;
+    return a;
+}
+
+/* Attach attributes to an event handle returned by otel_span_event.  No-op if
+ * the handle is NULL (unsampled trace) or the arena is full.  String values are
+ * copied into the span's arena. */
+static inline void
+otel_event_attr_str(struct otel_span *s, struct otel_event *e,
+                    const char *key, const char *value)
+{
+    struct otel_attr *a = otel_event_attr_(s, e, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_STR;
+        a->val  = otel_arena_put(s, value);
+    }
+}
+
+static inline void
+otel_event_attr_strn(struct otel_span *s, struct otel_event *e,
+                     const char *key, const char *value, size_t len)
+{
+    struct otel_attr *a = otel_event_attr_(s, e, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_STR;
+        a->val  = otel_arena_putn(s, value, len);
+    }
+}
+
+static inline void
+otel_event_attr_i64(struct otel_span *s, struct otel_event *e,
+                    const char *key, int64_t value)
+{
+    struct otel_attr *a = otel_event_attr_(s, e, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_I64;
+        a->v.i  = value;
+    }
+}
+
+static inline void
+otel_event_attr_u64(struct otel_span *s, struct otel_event *e,
+                    const char *key, uint64_t value)
+{
+    struct otel_attr *a = otel_event_attr_(s, e, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_U64;
+        a->v.u  = value;
+    }
+}
+
+static inline void
+otel_event_attr_bool(struct otel_span *s, struct otel_event *e,
+                     const char *key, int value)
+{
+    struct otel_attr *a = otel_event_attr_(s, e, key);
+
+    if (a) {
+        a->type = OTEL_ATTR_BOOL;
+        a->v.b  = value ? 1 : 0;
+    }
 }
 
 /* Set the span status (e.g. on error).  message is copied into the span's arena
@@ -477,7 +716,7 @@ otel_span_set_status(struct otel_span *s, enum otel_status status,
         return;
     }
     s->status         = (uint8_t) status;
-    s->status_message = otel_strput(s, message);
+    s->status_message = otel_arena_put(s, message);
 }
 
 /* End the span on its home thread: stamps end time and stages it for emission. */
@@ -499,6 +738,7 @@ otel_span_end(struct otel_span *s)
  * not be linked.
  */
 struct otel_span { };
+struct otel_event;   /* opaque event handle; never dereferenced in this mode */
 
 typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
 
@@ -552,8 +792,18 @@ static inline void otel_span_attr_u64(struct otel_span *s, const char *key, uint
 { (void) s; (void) key; (void) value; }
 static inline void otel_span_attr_bool(struct otel_span *s, const char *key, int value)
 { (void) s; (void) key; (void) value; }
-static inline void otel_span_event(struct otel_span *s, const char *name)
-{ (void) s; (void) name; }
+static inline struct otel_event *otel_span_event(struct otel_span *s, const char *name)
+{ (void) s; (void) name; return (struct otel_event *) 0; }
+static inline void otel_event_attr_str(struct otel_span *s, struct otel_event *e, const char *key, const char *value)
+{ (void) s; (void) e; (void) key; (void) value; }
+static inline void otel_event_attr_strn(struct otel_span *s, struct otel_event *e, const char *key, const char *value, size_t len)
+{ (void) s; (void) e; (void) key; (void) value; (void) len; }
+static inline void otel_event_attr_i64(struct otel_span *s, struct otel_event *e, const char *key, int64_t value)
+{ (void) s; (void) e; (void) key; (void) value; }
+static inline void otel_event_attr_u64(struct otel_span *s, struct otel_event *e, const char *key, uint64_t value)
+{ (void) s; (void) e; (void) key; (void) value; }
+static inline void otel_event_attr_bool(struct otel_span *s, struct otel_event *e, const char *key, int value)
+{ (void) s; (void) e; (void) key; (void) value; }
 static inline void otel_span_set_status(struct otel_span *s, enum otel_status status,
                                         const char *message)
 { (void) s; (void) status; (void) message; }

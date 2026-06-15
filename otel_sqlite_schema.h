@@ -18,7 +18,7 @@
 #define OTEL_SQLITE_SCHEMA_H
 
 /* Bump when the table layout changes; stored in PRAGMA user_version. */
-#define OTEL_SQLITE_SCHEMA_VERSION 1
+#define OTEL_SQLITE_SCHEMA_VERSION 2
 
 /* Attribute value types stored in span_attrs.type (mirror enum otel_attr_type).
  * The CLI uses these to pick which value column to read. */
@@ -50,15 +50,25 @@ static const char OTEL_SQLITE_SCHEMA[] =
     "  d_val   REAL"
     ");"
     "CREATE TABLE IF NOT EXISTS span_events ("
+    "  id           INTEGER PRIMARY KEY,"
     "  span         INTEGER NOT NULL,"
     "  name         TEXT,"
     "  time_unix_ns INTEGER"
+    ");"
+    "CREATE TABLE IF NOT EXISTS span_event_attrs ("
+    "  event   INTEGER NOT NULL,"
+    "  key     TEXT,"
+    "  type    INTEGER,"
+    "  s_val   TEXT,"
+    "  i_val   INTEGER,"
+    "  d_val   REAL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_spans_trace    ON spans(trace_id);"
     "CREATE INDEX IF NOT EXISTS idx_spans_start    ON spans(start_unix_ns);"
     "CREATE INDEX IF NOT EXISTS idx_spans_name     ON spans(name);"
     "CREATE INDEX IF NOT EXISTS idx_spans_duration ON spans(duration_ns);"
     "CREATE INDEX IF NOT EXISTS idx_attrs_span     ON span_attrs(span);"
-    "CREATE INDEX IF NOT EXISTS idx_events_span    ON span_events(span);";
+    "CREATE INDEX IF NOT EXISTS idx_events_span    ON span_events(span);"
+    "CREATE INDEX IF NOT EXISTS idx_event_attrs_event ON span_event_attrs(event);";
 
 #endif /* OTEL_SQLITE_SCHEMA_H */

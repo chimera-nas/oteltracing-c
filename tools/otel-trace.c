@@ -224,6 +224,62 @@ struct snode {
     int           printed;
 };
 
+/* Build a padding string of `width` spaces (capped) into `pad` (>=64 bytes). */
+static void
+make_pad(char *pad, int width)
+{
+    if (width > 60) {
+        width = 60;
+    }
+    if (width < 0) {
+        width = 0;
+    }
+    memset(pad, ' ', width);
+    pad[width] = '\0';
+}
+
+/* Print the rows of a prepared+bound statement selecting (key,type,s_val,i_val,
+ * d_val), one "<pad>- key = value" line each, then finalize it.  Shared by span
+ * and event attribute printing (identical column layout). */
+static void
+print_attr_rows(sqlite3_stmt *st, const char *pad)
+{
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *k = sqlite3_column_text(st, 0);
+        int                  t = sqlite3_column_int(st, 1);
+
+        printf("%s- %s = ", pad, k ? (const char *) k : "?");
+        switch (t) {
+            case 0:  printf("\"%s\"\n", sqlite3_column_text(st, 2)); break;
+            case 1:
+            case 2:  printf("%lld\n", (long long) sqlite3_column_int64(st, 3));
+                break;
+            case 3:  printf("%g\n", sqlite3_column_double(st, 4)); break;
+            case 4:  printf("%s\n",
+                            sqlite3_column_int64(st, 3) ? "true" : "false");
+                break;
+            default: printf("?\n"); break;
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+/* Print one event's attributes, indented `width` spaces. */
+static void
+print_event_attrs(sqlite3 *db, sqlite3_int64 event_id, int width)
+{
+    sqlite3_stmt *st;
+    char          pad[64];
+
+    make_pad(pad, width);
+    if (sqlite3_prepare_v2(db,
+            "SELECT key,type,s_val,i_val,d_val FROM span_event_attrs WHERE event=?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, event_id);
+        print_attr_rows(st, pad);
+    }
+}
+
 static void
 print_attrs_events(sqlite3 *db, sqlite3_int64 span_id, int depth)
 {
@@ -231,43 +287,28 @@ print_attrs_events(sqlite3 *db, sqlite3_int64 span_id, int depth)
     char          pad[64];
     int           p = depth * 2 + 2;
 
+    make_pad(pad, p);
     if (p > 60) {
         p = 60;
     }
-    memset(pad, ' ', p);
-    pad[p] = '\0';
 
     if (sqlite3_prepare_v2(db,
             "SELECT key,type,s_val,i_val,d_val FROM span_attrs WHERE span=?",
             -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, span_id);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const unsigned char *k = sqlite3_column_text(st, 0);
-            int                  t = sqlite3_column_int(st, 1);
-
-            printf("%s- %s = ", pad, k ? (const char *) k : "?");
-            switch (t) {
-                case 0:  printf("\"%s\"\n", sqlite3_column_text(st, 2)); break;
-                case 1:
-                case 2:  printf("%lld\n", (long long) sqlite3_column_int64(st, 3));
-                    break;
-                case 3:  printf("%g\n", sqlite3_column_double(st, 4)); break;
-                case 4:  printf("%s\n",
-                                sqlite3_column_int64(st, 3) ? "true" : "false");
-                    break;
-                default: printf("?\n"); break;
-            }
-        }
-        sqlite3_finalize(st);
+        print_attr_rows(st, pad);
     }
 
     if (sqlite3_prepare_v2(db,
-            "SELECT name,time_unix_ns FROM span_events WHERE span=? "
+            "SELECT id,name,time_unix_ns FROM span_events WHERE span=? "
             "ORDER BY time_unix_ns", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, span_id);
         while (sqlite3_step(st) == SQLITE_ROW) {
+            sqlite3_int64 event_id = sqlite3_column_int64(st, 0);
+
             printf("%s* event: %s\n", pad,
-                   sqlite3_column_text(st, 0));
+                   sqlite3_column_text(st, 1));
+            print_event_attrs(db, event_id, p + 2);
         }
         sqlite3_finalize(st);
     }

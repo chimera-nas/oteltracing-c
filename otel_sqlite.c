@@ -46,6 +46,7 @@ static struct {
     sqlite3_stmt *ins_span;
     sqlite3_stmt *ins_attr;
     sqlite3_stmt *ins_event;
+    sqlite3_stmt *ins_event_attr;
 
     sqlite3_int64 cur_span;        /* rowid of the span being inserted */
     int           in_txn;          /* a transaction is open (begin succeeded) */
@@ -96,6 +97,46 @@ otel_sqlite_exec(const char *sql)
     return 0;
 }
 
+/* Bind and execute one attribute row.  `st` is a prepared INSERT whose first
+ * bound column is the owner rowid (a span id for span_attrs, an event id for
+ * span_event_attrs) followed by (key,type,s_val,i_val,d_val).  Shared by span
+ * and event attributes, which have identical column layouts. */
+static void
+otel_sqlite_insert_attr(
+    sqlite3_stmt           *st,
+    sqlite3_int64           owner,
+    const struct otel_span *s,
+    const struct otel_attr *a)
+{
+    sqlite3_reset(st);
+    sqlite3_bind_int64(st, 1, owner);
+    sqlite3_bind_text(st, 2, otel_attr_key(s, a), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, a->type);
+    sqlite3_bind_null(st, 4);
+    sqlite3_bind_null(st, 5);
+    sqlite3_bind_null(st, 6);
+    switch (a->type) {
+        case OTEL_ATTR_STR:
+            sqlite3_bind_text(st, 4, otel_attr_strval(s, a), -1, SQLITE_TRANSIENT);
+            break;
+        case OTEL_ATTR_I64:
+            sqlite3_bind_int64(st, 5, (sqlite3_int64) a->v.i);
+            break;
+        case OTEL_ATTR_U64:
+            sqlite3_bind_int64(st, 5, (sqlite3_int64) a->v.u);
+            break;
+        case OTEL_ATTR_F64:
+            sqlite3_bind_double(st, 6, a->v.d);
+            break;
+        case OTEL_ATTR_BOOL:
+            sqlite3_bind_int64(st, 5, a->v.b ? 1 : 0);
+            break;
+        default:
+            break;
+    } /* switch */
+    sqlite3_step(st);
+} /* otel_sqlite_insert_attr */
+
 /* ---- sink callbacks (run on the flusher thread, inside otel_drain) ---- */
 
 static void
@@ -114,7 +155,6 @@ otel_sqlite_span(
     char  span_hex[17];
     char  parent_hex[17];
     sqlite3_stmt *st;
-    int   i;
 
     (void) priv;
 
@@ -136,10 +176,10 @@ otel_sqlite_span(
         sqlite3_bind_null(st, 3);
     }
     sqlite3_bind_text(st, 4, otel_service_name(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 5, s->name ? s->name : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, otel_span_name(s), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 6, s->kind);
     sqlite3_bind_int(st, 7, s->status);
-    sqlite3_bind_text(st, 8, s->status_message ? s->status_message : "",
+    sqlite3_bind_text(st, 8, otel_span_status_message(s),
                       -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 9, (sqlite3_int64) s->start_unix_ns);
     sqlite3_bind_int64(st, 10, (sqlite3_int64) s->end_unix_ns);
@@ -153,49 +193,28 @@ otel_sqlite_span(
     S.cur_span = sqlite3_last_insert_rowid(S.db);
 
     /* Attributes. */
-    for (i = 0; i < s->num_attrs; i++) {
-        const struct otel_attr *a = &s->attrs[i];
-
-        st = S.ins_attr;
-        sqlite3_reset(st);
-        sqlite3_bind_int64(st, 1, S.cur_span);
-        sqlite3_bind_text(st, 2, a->key ? a->key : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 3, a->type);
-        sqlite3_bind_null(st, 4);
-        sqlite3_bind_null(st, 5);
-        sqlite3_bind_null(st, 6);
-        switch (a->type) {
-            case OTEL_ATTR_STR:
-                sqlite3_bind_text(st, 4, a->v.s ? a->v.s : "", -1, SQLITE_TRANSIENT);
-                break;
-            case OTEL_ATTR_I64:
-                sqlite3_bind_int64(st, 5, (sqlite3_int64) a->v.i);
-                break;
-            case OTEL_ATTR_U64:
-                sqlite3_bind_int64(st, 5, (sqlite3_int64) a->v.u);
-                break;
-            case OTEL_ATTR_F64:
-                sqlite3_bind_double(st, 6, a->v.d);
-                break;
-            case OTEL_ATTR_BOOL:
-                sqlite3_bind_int64(st, 5, a->v.b ? 1 : 0);
-                break;
-            default:
-                break;
-        } /* switch */
-        sqlite3_step(st);
+    for (const struct otel_attr *a = otel_attr_first(s); a; a = otel_attr_next(s, a)) {
+        otel_sqlite_insert_attr(S.ins_attr, S.cur_span, s, a);
     }
 
-    /* Events. */
-    for (i = 0; i < s->num_events; i++) {
-        const struct otel_event *e = &s->events[i];
+    /* Events, each with its own attributes. */
+    for (const struct otel_event *e = otel_event_first(s); e; e = otel_event_next(s, e)) {
+        sqlite3_int64 event_id;
 
         st = S.ins_event;
         sqlite3_reset(st);
         sqlite3_bind_int64(st, 1, S.cur_span);
-        sqlite3_bind_text(st, 2, e->name ? e->name : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, otel_event_name(s, e), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 3, (sqlite3_int64) e->time_unix_ns);
-        sqlite3_step(st);
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            continue;
+        }
+        event_id = sqlite3_last_insert_rowid(S.db);
+
+        for (const struct otel_attr *a = otel_event_attr_first(s, e); a;
+             a = otel_attr_next(s, a)) {
+            otel_sqlite_insert_attr(S.ins_event_attr, event_id, s, a);
+        }
     }
 } /* otel_sqlite_span */
 
@@ -204,7 +223,7 @@ otel_sqlite_prune(void)
 {
     sqlite3_stmt *st = NULL;
     sqlite3_int64 maxid, cutoff;
-    char          buf[256];
+    char          buf[512];
 
     if (S.max_spans == 0) {
         return;
@@ -223,10 +242,13 @@ otel_sqlite_prune(void)
     }
 
     snprintf(buf, sizeof(buf),
+             "DELETE FROM span_event_attrs WHERE event IN "
+             "(SELECT id FROM span_events WHERE span <= %lld);"
              "DELETE FROM span_attrs WHERE span <= %lld;"
              "DELETE FROM span_events WHERE span <= %lld;"
              "DELETE FROM spans WHERE id <= %lld;",
-             (long long) cutoff, (long long) cutoff, (long long) cutoff);
+             (long long) cutoff, (long long) cutoff, (long long) cutoff,
+             (long long) cutoff);
     otel_sqlite_exec(buf);
 }
 
@@ -335,7 +357,10 @@ otel_sqlite_open(
             "VALUES(?,?,?,?,?,?)", -1, &S.ins_attr, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(S.db,
             "INSERT INTO span_events(span,name,time_unix_ns) "
-            "VALUES(?,?,?)", -1, &S.ins_event, NULL) != SQLITE_OK) {
+            "VALUES(?,?,?)", -1, &S.ins_event, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(S.db,
+            "INSERT INTO span_event_attrs(event,key,type,s_val,i_val,d_val) "
+            "VALUES(?,?,?,?,?,?)", -1, &S.ins_event_attr, NULL) != SQLITE_OK) {
         fprintf(stderr, "otel_sqlite: prepare failed: %s\n",
                 sqlite3_errmsg(S.db));
         otel_sqlite_close();
@@ -394,6 +419,9 @@ otel_sqlite_close(void)
     }
     if (S.ins_event) {
         sqlite3_finalize(S.ins_event);
+    }
+    if (S.ins_event_attr) {
+        sqlite3_finalize(S.ins_event_attr);
     }
     if (S.db) {
         /* Fold the WAL back into the main db so the file is self-contained. */

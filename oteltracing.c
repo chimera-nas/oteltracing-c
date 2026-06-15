@@ -50,13 +50,19 @@
 #define OTEL_RING_SIZE 2048
 #endif
 
-/* Max spans packed into a single ExportTraceServiceRequest. */
-#define OTEL_BATCH_SPANS 256
-#define OTEL_BATCH_ATTRS (OTEL_BATCH_SPANS * OTEL_SPAN_MAX_ATTRS)
-#define OTEL_BATCH_EVENTS (OTEL_BATCH_SPANS * OTEL_SPAN_MAX_EVENTS)
+/* Max spans packed into a single ExportTraceServiceRequest, and the size of the
+ * shared protobuf key-value / event scratch pools the batch carves slices from.
+ * A span's attrs and events now share its arena, so a single span can hold many
+ * more than the old fixed caps (bounded only by the ~4 KiB arena, i.e. a couple
+ * hundred records); the pools are sized to comfortably hold one batch's worth. */
+#define OTEL_BATCH_SPANS  256
+#define OTEL_BATCH_ATTRS  2048
+#define OTEL_BATCH_EVENTS 1024
 
-/* Generous upper bound on a packed span; the request scratch is sized from it. */
-#define OTEL_SPAN_SERIALIZATION 4096
+/* Generous upper bound on a single packed span; the request scratch is sized from
+ * it.  A span's variable data is capped by its 4 KiB arena, so even a span packed
+ * full of attributes serializes to well under this. */
+#define OTEL_SPAN_SERIALIZATION 8192
 
 typedef Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest otlp_request_t;
 typedef Opentelemetry__Proto__Trace__V1__ResourceSpans                        otlp_rspans_t;
@@ -510,7 +516,7 @@ otel_span_init(
 {
     s->kind           = (uint8_t) kind;
     s->status         = OTEL_STATUS_UNSET;
-    s->status_message = NULL;
+    s->status_message = (uint16_t) OTEL_NIL;
     s->num_attrs      = 0;
     s->num_events     = 0;
     s->dropped_attrs  = 0;
@@ -518,11 +524,13 @@ otel_span_init(
     s->end_unix_ns    = 0;
     s->start_unix_ns  = OT.clock();
     s->flags          = OTEL_FLAG_RECORDING;
-    /* Reset the arena and copy the name in; flags must be set first so the
-     * arena helpers (which gate on RECORDING via the inline path) operate, but
-     * here we copy directly since this runs only for a recording span. */
-    s->str_used       = 0;
-    s->name           = otel_strput(s, name);
+    /* Reset the arena (empty attr/event lists) and copy the name in. */
+    s->arena_used     = 0;
+    s->attr_head      = (uint16_t) OTEL_NIL;
+    s->attr_tail      = (uint16_t) OTEL_NIL;
+    s->event_head     = (uint16_t) OTEL_NIL;
+    s->event_tail     = (uint16_t) OTEL_NIL;
+    s->name           = otel_arena_put(s, name);
 }
 
 SYMBOL_EXPORT void
@@ -594,61 +602,41 @@ otel_span_start_remote_(
     otel_span_init(s, name, kind);
 }
 
-SYMBOL_EXPORT void
+SYMBOL_EXPORT struct otel_event *
 otel_span_event_(
     struct otel_span *s,
     const char       *name)
 {
     struct otel_event *e;
+    uint16_t           noff, roff;
 
-    if (s->num_events >= OTEL_SPAN_MAX_EVENTS) {
+    noff = otel_arena_put(s, name);
+    roff = otel_arena_alloc(s, sizeof(struct otel_event));
+    if (roff == (uint16_t) OTEL_NIL) {
         if (s->dropped_events < 255) {
-            s->dropped_events++;
+            s->dropped_events++;   /* arena full: drop the event */
         }
-        return;
+        return (struct otel_event *) 0;
     }
-    e = &s->events[s->num_events++];
-    e->name         = otel_strput(s, name);
-    e->time_unix_ns = OT.clock();
+
+    e                = (struct otel_event *) &s->arena[roff];
+    e->next          = (uint16_t) OTEL_NIL;
+    e->name          = noff;
+    e->attr_head     = (uint16_t) OTEL_NIL;
+    e->attr_tail     = (uint16_t) OTEL_NIL;
+    e->num_attrs     = 0;
+    e->dropped_attrs = 0;
+    e->time_unix_ns  = OT.clock();
+
+    if (s->event_tail == (uint16_t) OTEL_NIL) {
+        s->event_head = roff;
+    } else {
+        ((struct otel_event *) &s->arena[s->event_tail])->next = roff;
+    }
+    s->event_tail = roff;
+    s->num_events++;
+    return e;
 }
-
-/* After a span is copied by value into a ring slot, its string pointers still
- * point into the SOURCE span's strbuf.  Rebase any pointer that falls within the
- * source arena to the same offset in the destination's own arena, so the ring
- * copy is fully self-contained once the source span is recycled. */
-static inline void
-otel_rebase_ptr(
-    const char      **p,
-    const char       *old_base,
-    const char       *new_base,
-    size_t            span)
-{
-    if (*p && *p >= old_base && *p < old_base + span) {
-        *p = new_base + (*p - old_base);
-    }
-}
-
-static void
-otel_span_rebase(
-    struct otel_span *dst,
-    const char       *old_base)
-{
-    const char *nb = dst->strbuf;
-    size_t      sz = OTEL_SPAN_STRBUF;
-    int         i;
-
-    otel_rebase_ptr(&dst->name, old_base, nb, sz);
-    otel_rebase_ptr(&dst->status_message, old_base, nb, sz);
-    for (i = 0; i < dst->num_attrs; i++) {
-        otel_rebase_ptr(&dst->attrs[i].key, old_base, nb, sz);
-        if (dst->attrs[i].type == OTEL_ATTR_STR) {
-            otel_rebase_ptr(&dst->attrs[i].v.s, old_base, nb, sz);
-        }
-    }
-    for (i = 0; i < dst->num_events; i++) {
-        otel_rebase_ptr(&dst->events[i].name, old_base, nb, sz);
-    }
-} /* otel_span_rebase */
 
 SYMBOL_EXPORT void
 otel_span_end_(struct otel_span *s)
@@ -674,9 +662,11 @@ otel_span_end_(struct otel_span *s)
         return;
     }
 
+    /* The span is position-independent: everything variable-length lives in its
+     * arena addressed by offsets, so a plain value copy is fully self-contained --
+     * no pointer rebasing needed. */
     slot  = &ctx->ring[head & ctx->mask];
     *slot = *s;
-    otel_span_rebase(slot, s->strbuf);   /* point strings into the slot's arena */
     atomic_store_explicit(&ctx->head, head + 1, memory_order_release);
 }
 
@@ -694,16 +684,66 @@ otlp_kind(uint8_t kind)
     } /* switch */
 } /* otlp_kind */
 
+/* Encode one finished attr into the next free slot of the shared KeyValue pool
+ * (o->attrp[o->num_attrs]) and advance the cursor.  Used for both span-level and
+ * event-level attributes, which draw from the same pool. */
+static void
+otlp_add_attr(
+    struct otel_otlp       *o,
+    const struct otel_span *s,
+    const struct otel_attr *a)
+{
+    otlp_kv_t  *kv = o->attrp[o->num_attrs];
+    otlp_any_t *av = kv->value;
+
+    kv->key = (char *) otel_attr_key(s, a);
+    switch (a->type) {
+        case OTEL_ATTR_STR:
+            av->value_case   = OTLP_ANY_STR;
+            av->string_value = (char *) otel_attr_strval(s, a);
+            break;
+        case OTEL_ATTR_I64:
+            av->value_case = OTLP_ANY_INT;
+            av->int_value  = a->v.i;
+            break;
+        case OTEL_ATTR_U64:
+            av->value_case = OTLP_ANY_INT;
+            av->int_value  = (int64_t) a->v.u;
+            break;
+        case OTEL_ATTR_F64:
+            av->value_case   = OTLP_ANY_DBL;
+            av->double_value = a->v.d;
+            break;
+        case OTEL_ATTR_BOOL:
+            av->value_case = OTLP_ANY_BOOL;
+            av->bool_value = a->v.b;
+            break;
+        default:
+            av->value_case   = OTLP_ANY_STR;
+            av->string_value = "";
+            break;
+    } /* switch */
+    o->num_attrs++;
+} /* otlp_add_attr */
+
 /* Map one finished span into the protobuf-c batch, flushing first if full. */
 static void
 otlp_add_span(const struct otel_span *s)
 {
-    struct otel_otlp *o = &OT.otlp;
-    otlp_span_t      *span;
-    size_t            i;
+    struct otel_otlp        *o = &OT.otlp;
+    otlp_span_t             *span;
+    const struct otel_attr  *sa;
+    const struct otel_event *se;
+    size_t                   event_attrs = 0;
+
+    /* Event attributes draw from the same KeyValue pool as span attributes, so
+     * the flush decision must account for them too. */
+    for (se = otel_event_first(s); se; se = otel_event_next(s, se)) {
+        event_attrs += se->num_attrs;
+    }
 
     if (o->sspans.n_spans == OTEL_BATCH_SPANS ||
-        o->num_attrs + s->num_attrs > OTEL_BATCH_ATTRS ||
+        o->num_attrs + s->num_attrs + event_attrs > OTEL_BATCH_ATTRS ||
         o->num_events + s->num_events > OTEL_BATCH_EVENTS) {
         otlp_flush();
     }
@@ -723,7 +763,7 @@ otlp_add_span(const struct otel_span *s)
         span->parent_span_id.len  = 0;
     }
 
-    span->name                = (char *) (s->name ? s->name : "");
+    span->name                = (char *) otel_span_name(s);
     span->kind                = otlp_kind(s->kind);
     span->start_time_unix_nano = s->start_unix_ns;
     span->end_time_unix_nano   = s->end_unix_ns;
@@ -731,59 +771,40 @@ otlp_add_span(const struct otel_span *s)
     span->status->code    = (s->status == OTEL_STATUS_ERROR) ? OTLP_STATUS_ERROR :
                             (s->status == OTEL_STATUS_OK)    ? OTLP_STATUS_OK :
                             OTLP_STATUS_UNSET;
-    span->status->message = (char *) (s->status_message ? s->status_message : "");
+    span->status->message = (char *) otel_span_status_message(s);
 
     span->dropped_attributes_count = s->dropped_attrs;
     span->dropped_events_count     = s->dropped_events;
 
-    /* Attributes: carve a slice from the shared attr pool. */
-    span->attributes  = &o->attrp[o->num_attrs];
-    span->n_attributes = s->num_attrs;
-    for (i = 0; i < s->num_attrs; i++) {
-        const struct otel_attr *sa = &s->attrs[i];
-        otlp_kv_t              *kv = o->attrp[o->num_attrs];
-        otlp_any_t             *av = kv->value;
-
-        kv->key = (char *) sa->key;
-        switch (sa->type) {
-            case OTEL_ATTR_STR:
-                av->value_case   = OTLP_ANY_STR;
-                av->string_value = (char *) (sa->v.s ? sa->v.s : "");
-                break;
-            case OTEL_ATTR_I64:
-                av->value_case = OTLP_ANY_INT;
-                av->int_value  = sa->v.i;
-                break;
-            case OTEL_ATTR_U64:
-                av->value_case = OTLP_ANY_INT;
-                av->int_value  = (int64_t) sa->v.u;
-                break;
-            case OTEL_ATTR_F64:
-                av->value_case   = OTLP_ANY_DBL;
-                av->double_value = sa->v.d;
-                break;
-            case OTEL_ATTR_BOOL:
-                av->value_case = OTLP_ANY_BOOL;
-                av->bool_value = sa->v.b;
-                break;
-            default:
-                av->value_case   = OTLP_ANY_STR;
-                av->string_value = "";
-                break;
-        } /* switch */
-        o->num_attrs++;
+    /* Attributes: walk the arena list, carving a slice from the shared attr pool. */
+    span->attributes   = &o->attrp[o->num_attrs];
+    span->n_attributes = 0;
+    for (sa = otel_attr_first(s); sa; sa = otel_attr_next(s, sa)) {
+        otlp_add_attr(o, s, sa);
+        span->n_attributes++;
     }
 
-    /* Events: carve a slice from the shared event pool. */
-    span->events  = &o->eventp[o->num_events];
-    span->n_events = s->num_events;
-    for (i = 0; i < s->num_events; i++) {
-        otlp_event_t *ev = o->eventp[o->num_events];
+    /* Events: walk the arena list, carving a slice from the shared event pool;
+     * each event's own attributes carve from the same KeyValue pool. */
+    span->events   = &o->eventp[o->num_events];
+    span->n_events = 0;
+    for (se = otel_event_first(s); se; se = otel_event_next(s, se)) {
+        otlp_event_t           *ev = o->eventp[o->num_events];
+        const struct otel_attr *ea;
 
-        ev->time_unix_nano = s->events[i].time_unix_ns;
-        ev->name           = (char *) (s->events[i].name ? s->events[i].name : "");
-        ev->n_attributes   = 0;
+        ev->time_unix_nano = se->time_unix_ns;
+        ev->name           = (char *) otel_event_name(s, se);
+
+        ev->attributes   = &o->attrp[o->num_attrs];
+        ev->n_attributes = 0;
+        for (ea = otel_event_attr_first(s, se); ea; ea = otel_attr_next(s, ea)) {
+            otlp_add_attr(o, s, ea);
+            ev->n_attributes++;
+        }
+        ev->dropped_attributes_count = se->dropped_attrs;
+
         o->num_events++;
+        span->n_events++;
     }
 
     o->sspans.n_spans++;
