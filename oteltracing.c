@@ -508,7 +508,6 @@ otel_span_init(
     const char       *name,
     uint8_t           kind)
 {
-    s->name           = name;
     s->kind           = (uint8_t) kind;
     s->status         = OTEL_STATUS_UNSET;
     s->status_message = NULL;
@@ -519,6 +518,11 @@ otel_span_init(
     s->end_unix_ns    = 0;
     s->start_unix_ns  = OT.clock();
     s->flags          = OTEL_FLAG_RECORDING;
+    /* Reset the arena and copy the name in; flags must be set first so the
+     * arena helpers (which gate on RECORDING via the inline path) operate, but
+     * here we copy directly since this runs only for a recording span. */
+    s->str_used       = 0;
+    s->name           = otel_strput(s, name);
 }
 
 SYMBOL_EXPORT void
@@ -604,14 +608,53 @@ otel_span_event_(
         return;
     }
     e = &s->events[s->num_events++];
-    e->name         = name;
+    e->name         = otel_strput(s, name);
     e->time_unix_ns = OT.clock();
 }
+
+/* After a span is copied by value into a ring slot, its string pointers still
+ * point into the SOURCE span's strbuf.  Rebase any pointer that falls within the
+ * source arena to the same offset in the destination's own arena, so the ring
+ * copy is fully self-contained once the source span is recycled. */
+static inline void
+otel_rebase_ptr(
+    const char      **p,
+    const char       *old_base,
+    const char       *new_base,
+    size_t            span)
+{
+    if (*p && *p >= old_base && *p < old_base + span) {
+        *p = new_base + (*p - old_base);
+    }
+}
+
+static void
+otel_span_rebase(
+    struct otel_span *dst,
+    const char       *old_base)
+{
+    const char *nb = dst->strbuf;
+    size_t      sz = OTEL_SPAN_STRBUF;
+    int         i;
+
+    otel_rebase_ptr(&dst->name, old_base, nb, sz);
+    otel_rebase_ptr(&dst->status_message, old_base, nb, sz);
+    for (i = 0; i < dst->num_attrs; i++) {
+        otel_rebase_ptr(&dst->attrs[i].key, old_base, nb, sz);
+        if (dst->attrs[i].type == OTEL_ATTR_STR) {
+            otel_rebase_ptr(&dst->attrs[i].v.s, old_base, nb, sz);
+        }
+    }
+    for (i = 0; i < dst->num_events; i++) {
+        otel_rebase_ptr(&dst->events[i].name, old_base, nb, sz);
+    }
+} /* otel_span_rebase */
 
 SYMBOL_EXPORT void
 otel_span_end_(struct otel_span *s)
 {
     struct otel_thread_ctx *ctx = otel_tls;
+    struct otel_span       *slot;
     uint64_t                head, tail;
 
     s->end_unix_ns = OT.clock();
@@ -631,7 +674,9 @@ otel_span_end_(struct otel_span *s)
         return;
     }
 
-    ctx->ring[head & ctx->mask] = *s;
+    slot  = &ctx->ring[head & ctx->mask];
+    *slot = *s;
+    otel_span_rebase(slot, s->strbuf);   /* point strings into the slot's arena */
     atomic_store_explicit(&ctx->head, head + 1, memory_order_release);
 }
 

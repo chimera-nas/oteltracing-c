@@ -212,6 +212,56 @@ main(void)
     otel_span_end(&se);
     CHECK(otel_drain() == 1);
 
+    /* ---- string arena: name/key/value are copied, so they survive the caller
+     * mutating (or freeing) the source strings before the span is drained. ---- */
+    {
+        char nbuf[16], kbuf[16], vbuf[32];
+
+        strcpy(nbuf, "dyn-op");
+        strcpy(kbuf, "dyn-key");
+        strcpy(vbuf, "dyn-value");
+
+        struct otel_span ms;
+        otel_span_start(&ms, nbuf, OTEL_SPAN_INTERNAL);
+        otel_span_attr_str(&ms, kbuf, vbuf);
+        otel_span_attr_strn(&ms, "five", "abcdefghij", 5);   /* -> "abcde" */
+
+        /* Clobber the caller's buffers before the span is drained. */
+        memset(nbuf, 'Z', sizeof(nbuf));
+        memset(kbuf, 'Z', sizeof(kbuf));
+        memset(vbuf, 'Z', sizeof(vbuf));
+
+        otel_span_end(&ms);
+        g_len = 0;
+        CHECK(otel_drain() == 1);
+
+        struct grpc_hdr *mh = (struct grpc_hdr *) g_buf;
+        Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest *mreq =
+            opentelemetry__proto__collector__trace__v1__export_trace_service_request__unpack(
+                NULL, ntohl(mh->length), g_buf + sizeof(*mh));
+        CHECK(mreq != NULL);
+        if (mreq) {
+            Opentelemetry__Proto__Trace__V1__Span *msp =
+                mreq->resource_spans[0]->scope_spans[0]->spans[0];
+            CHECK(strcmp(msp->name, "dyn-op") == 0);
+            CHECK(msp->n_attributes == 2);
+            int found_kv = 0, found_five = 0;
+            for (size_t i = 0; i < msp->n_attributes; i++) {
+                if (strcmp(msp->attributes[i]->key, "dyn-key") == 0) {
+                    found_kv = (strcmp(msp->attributes[i]->value->string_value,
+                                       "dyn-value") == 0);
+                } else if (strcmp(msp->attributes[i]->key, "five") == 0) {
+                    found_five = (strcmp(msp->attributes[i]->value->string_value,
+                                         "abcde") == 0);
+                }
+            }
+            CHECK(found_kv);
+            CHECK(found_five);
+            opentelemetry__proto__collector__trace__v1__export_trace_service_request__free_unpacked(
+                mreq, NULL);
+        }
+    }
+
     otel_thread_unregister();
     otel_shutdown();
 

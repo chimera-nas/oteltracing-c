@@ -21,8 +21,14 @@ Most tracing libraries assume millisecond-scale work and freely allocate and
 lock per span. This one is built for hot paths:
 
 - **No heap allocation on the span hot path.** A span is an embeddable POD
-  (`struct otel_span`) you place inside your own request/operation struct.
-  Attributes and events are stored *inline* in that struct.
+  (`struct otel_span`, exactly 4 KiB) you place inside your own request/operation
+  struct. Attributes and events are stored *inline* in that struct.
+- **Self-contained, no borrowed strings.** Every string — the span name,
+  attribute keys and string values, event names, the status message — is *copied*
+  into an inline arena in the span, so nothing borrows caller memory and the span
+  can be copied by value. If the arena fills, further strings are dropped (their
+  value becomes NULL). You can pass a stack/temporary string and free it
+  immediately; the span keeps its own copy.
 - **No locks on the hot path.** Finished spans are published into a per-thread
   lock-free SPSC ring; a single consumer drains them.
 - **Cheap timestamps.** Time comes from a TSC-backed clock (the shared
@@ -282,7 +288,8 @@ parent-op [server] 451ns (+0ns)
 | `otel_drain()` | Encode and export finished spans (single consumer). |
 | `otel_dropped_spans()` | Count of spans dropped due to ring overflow. |
 | `otel_span_start` / `_start_child` / `_start_remote` | Begin a span. |
-| `otel_span_attr_str` / `_i64` / `_u64` / `_bool` | Add an attribute (safe mid-flight). |
+| `otel_span_set_name(s, name)` | Replace the span name once known (copied). |
+| `otel_span_attr_str` / `_strn` / `_i64` / `_u64` / `_bool` | Add an attribute (safe mid-flight; strings copied, `_strn` for non-NUL-terminated). |
 | `otel_span_event(s, name)` | Add a timestamped event (safe mid-flight). |
 | `otel_span_set_status(s, status, msg)` | Set span status. |
 | `otel_span_end(s)` | End and stage the span (home thread). |
