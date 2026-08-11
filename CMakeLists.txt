@@ -56,7 +56,16 @@ target_include_directories(oteltracing-c
     PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/ext/stopwatch)
 
-target_link_libraries(oteltracing-c ${PROTOBUF_C_LIB} uuid pthread)
+# uuid_generate(3) is in libSystem on Darwin: <uuid/uuid.h> resolves, but there
+# is no separate libuuid, so asking to link one fails.  Everywhere else it comes
+# from util-linux and does have to be named.
+if(APPLE)
+    set(UUID_LIBS "")
+else()
+    set(UUID_LIBS uuid)
+endif()
+
+target_link_libraries(oteltracing-c ${PROTOBUF_C_LIB} ${UUID_LIBS} pthread)
 
 # The decode-verify test needs the generated pb-c headers/sources to unpack what
 # the library produced.  Build it standalone (no collector / network required).
