@@ -15,7 +15,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <sqlite3.h>
 
@@ -65,20 +69,22 @@ scalar_text(sqlite3 *db, const char *sql, char *out, size_t outlen)
 int
 main(void)
 {
-    char             path[] = "/tmp/otel_sqlite_test_XXXXXX";
-    int              fd;
+    char             path[1024];
     sqlite3         *db;
     struct otel_span parent, child;
     char             buf[128];
     char             buf2[128];
 
-    fd = mkstemp(path);
-    if (fd < 0) {
-        perror("mkstemp");
-        return 1;
-    }
+#ifdef _WIN32
+    char tempdir[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, tempdir) || !GetTempFileNameA(tempdir, "otl", 0, path)) return 1;
+#else
+    snprintf(path, sizeof(path), "/tmp/otel_sqlite_test_XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) return 1;
     close(fd);
-    unlink(path);   /* sqlite_open will recreate it */
+#endif
+    remove(path); /* sqlite_open will recreate it */
 
     otel_init("sqlite-test");
     /* Long flush interval so we control timing via close()'s final drain. */
@@ -109,7 +115,7 @@ main(void)
     /* ---- verify ---- */
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
         fprintf(stderr, "reopen failed\n");
-        unlink(path);
+        remove(path);
         return 1;
     }
 
@@ -174,7 +180,7 @@ main(void)
         "AND start_unix_ns > 0 AND end_unix_ns >= start_unix_ns") == 2);
 
     sqlite3_close(db);
-    unlink(path);
+    remove(path);
 
     if (g_failures) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

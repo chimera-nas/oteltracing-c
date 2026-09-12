@@ -16,15 +16,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <arpa/inet.h>
+#include "otel_platform.h"
 
 #include "oteltracing.h"
 #include "opentelemetry/proto/collector/trace/v1/trace_service.pb-c.h"
 
 struct grpc_hdr {
     uint8_t  compressed;
-    uint32_t length;
-} __attribute__((packed));
+    uint8_t  length[4];
+};
 
 static uint8_t  g_buf[1 << 20];
 static size_t   g_len;
@@ -85,7 +85,7 @@ main(void)
     /* Decode the captured gRPC-framed payload. */
     struct grpc_hdr *hdr = (struct grpc_hdr *) g_buf;
     CHECK(hdr->compressed == 0);
-    uint32_t plen = ntohl(hdr->length);
+    uint32_t plen = otel_load_be32(hdr->length);
     CHECK(plen == g_len - sizeof(*hdr));
 
     Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest *req =
@@ -255,7 +255,7 @@ main(void)
         struct grpc_hdr *mh = (struct grpc_hdr *) g_buf;
         Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest *mreq =
             opentelemetry__proto__collector__trace__v1__export_trace_service_request__unpack(
-                NULL, ntohl(mh->length), g_buf + sizeof(*mh));
+                NULL, otel_load_be32(mh->length), g_buf + sizeof(*mh));
         CHECK(mreq != NULL);
         if (mreq) {
             Opentelemetry__Proto__Trace__V1__Span *msp =
@@ -304,7 +304,7 @@ main(void)
         struct grpc_hdr *bh = (struct grpc_hdr *) g_buf;
         Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest *breq =
             opentelemetry__proto__collector__trace__v1__export_trace_service_request__unpack(
-                NULL, ntohl(bh->length), g_buf + sizeof(*bh));
+                NULL, otel_load_be32(bh->length), g_buf + sizeof(*bh));
         CHECK(breq != NULL);
         if (breq) {
             Opentelemetry__Proto__Trace__V1__Span *bsp =

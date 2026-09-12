@@ -24,6 +24,16 @@
 #ifndef OTEL_SQLITE_H
 #define OTEL_SQLITE_H
 
+#ifdef _WIN32
+#ifdef OTEL_SQLITE_BUILD
+#define OTEL_SQLITE_API __declspec(dllexport)
+#else
+#define OTEL_SQLITE_API __declspec(dllimport)
+#endif
+#else
+#define OTEL_SQLITE_API __attribute__((visibility("default")))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,20 +43,20 @@ extern "C" {
  * is the drain cadence (0 selects a sensible default).  Each drain is written as
  * one large transaction.  Returns 0 on success, -1 on failure.
  */
-int otel_sqlite_open(const char *path, unsigned int flush_interval_ms);
+OTEL_SQLITE_API int otel_sqlite_open(const char *path, unsigned int flush_interval_ms);
 
 /*
  * Optional retention cap: keep at most ~`max_spans` span rows, pruning the oldest
  * traces as new ones arrive (0, the default, disables pruning).  Primary volume
  * control remains head sampling (otel_set_sampler).
  */
-void otel_sqlite_set_max_spans(unsigned long max_spans);
+OTEL_SQLITE_API void otel_sqlite_set_max_spans(unsigned long max_spans);
 
 /*
  * Stop the flusher thread, drain and commit any remaining spans, detach the sink,
  * and close the database.  Safe to call even if otel_sqlite_open() failed.
  */
-void otel_sqlite_close(void);
+OTEL_SQLITE_API void otel_sqlite_close(void);
 
 #ifdef __cplusplus
 }

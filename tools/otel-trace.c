@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "otel_platform.h"
 #include <inttypes.h>
 
 #include <sqlite3.h>
@@ -72,7 +73,11 @@ fmt_time(long long unix_ns, char *out, size_t outlen)
     struct tm tm;
     char      base[32];
 
+#ifdef _WIN32
+    localtime_s(&tm, &secs);
+#else
     localtime_r(&secs, &tm);
+#endif
     strftime(base, sizeof(base), "%Y-%m-%d %H:%M:%S", &tm);
     snprintf(out, outlen, "%s.%03ld", base, ms);
 }
@@ -143,7 +148,7 @@ bind_filters(sqlite3_stmt *st, int idx, const struct filters *f)
         sqlite3_bind_text(st, idx++, f->name, -1, SQLITE_TRANSIENT);
     }
     if (f->since_sec) {
-        clock_gettime(CLOCK_REALTIME, &now);
+        otel_realtime(&now);
         sqlite3_bind_int64(st, idx++,
             ((sqlite3_int64) now.tv_sec - f->since_sec) * 1000000000LL);
     }

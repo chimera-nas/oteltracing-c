@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: 2026 Ben Jarvis
+# SPDX-License-Identifier: MIT
+name: Build and test
+on:
+  push:
+    branches: [main, windows-msvc]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    permissions:
+      contents: read
+    name: ${{ matrix.platform.name }} ${{ matrix.config }}
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+        platform:
+          - {name: windows-x64, runner: windows-2022, arch: x64, triplet: x64-windows}
+          - {name: windows-arm64, runner: windows-11-arm, arch: ARM64, triplet: arm64-windows}
+          - {name: macos-arm64, runner: macos-14, arch: ARM64, triplet: arm64-windows}
+          - {name: linux-x64, runner: ubuntu-24.04, arch: x64, triplet: x64-windows}
+          - {name: linux-arm64, runner: ubuntu-24.04-arm, arch: ARM64, triplet: arm64-windows}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/checkout@v4
+        if: runner.os == 'Windows'
+        with:
+          repository: microsoft/vcpkg
+          ref: a1cae005c39be7b18ba319fced856b68d7276271
+          path: _vcpkg
+      - uses: actions/cache/restore@v4
+        id: vcpkg-cache
+        if: runner.os == 'Windows'
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ matrix.platform.name }}-${{ hashFiles('vcpkg.json') }}
+      - name: Configure Windows with native dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./_vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.platform.arch }} -DCMAKE_TOOLCHAIN_FILE="$pwd/_vcpkg/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=${{ matrix.platform.triplet }} -DVCPKG_HOST_TRIPLET=${{ matrix.platform.triplet }} -DOTEL_SQLITE=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # Preserve successfully built packages even when project compilation fails.
+      - uses: actions/cache/save@v4
+        if: runner.os == 'Windows' && always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ matrix.platform.name }}-${{ hashFiles('vcpkg.json') }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build protobuf-c-compiler libprotobuf-c-dev uuid-dev libsqlite3-dev
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja protobuf-c sqlite
+      - name: Configure Unix
+        if: runner.os != 'Windows'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }} -DOTEL_SQLITE=ON -DCMAKE_PREFIX_PATH=/opt/homebrew
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel 4
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --no-tests=error --timeout 60 --output-junit results.xml
+      - name: Install
+        run: cmake --install build --config ${{ matrix.config }} --prefix install
+      - name: Include Windows runtime dependencies
+        if: runner.os == 'Windows'
+        run: Copy-Item build/bin/${{ matrix.config }}/*.dll install/bin -Force
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oteltracing-c-${{ matrix.platform.name }}-${{ matrix.config }}
+          path: |
+            install/
+            build/results.xml
+            build/Testing/Temporary/LastTest.log
+            build/vcpkg-manifest-install.log

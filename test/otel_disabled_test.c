@@ -21,9 +21,14 @@ main(void)
     struct otel_span s;          /* zero-size; the embedded member costs nothing */
     uint8_t          trace_id[16] = { 0 };
 
-    if (sizeof(struct otel_span) != 0) {
+#ifdef _MSC_VER
+    const size_t expected_size = 1;
+#else
+    const size_t expected_size = 0;
+#endif
+    if (sizeof(struct otel_span) != expected_size) {
         fprintf(stderr, "otel_disabled_test: struct otel_span is %zu bytes, "
-                "expected 0\n", sizeof(struct otel_span));
+                "expected %zu\n", sizeof(struct otel_span), expected_size);
         return 1;
     }
 

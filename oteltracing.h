@@ -34,6 +34,16 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifdef _WIN32
+#ifdef OTEL_BUILD
+#define OTEL_API __declspec(dllexport)
+#else
+#define OTEL_API __declspec(dllimport)
+#endif
+#else
+#define OTEL_API __attribute__((visibility("default")))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,7 +51,7 @@ extern "C" {
 /*
  * Compile-time master switch.  Define OTEL_TRACING=0 (e.g. -DOTEL_TRACING=0) to
  * strip tracing entirely from a translation unit: struct otel_span becomes
- * zero-size and every API call below compiles to nothing, with no link
+ * zero-size (one byte with MSVC) and every API call below compiles to nothing, with no link
  * dependency on liboteltracing-c.  Defaults to enabled.
  */
 #ifndef OTEL_TRACING
@@ -183,15 +193,15 @@ _Static_assert(sizeof(struct otel_span) == 4096,
  * resource attribute).  Tracing only actually emits once a transport has been
  * registered via otel_set_transport().  Returns 0 on success.
  */
-int  otel_init(const char *service);
+OTEL_API int  otel_init(const char *service);
 
 /* Tear down the tracer.  Drains any remaining spans through the transport. */
-void otel_shutdown(void);
+OTEL_API void otel_shutdown(void);
 
 /* Register/unregister the calling thread.  Required on any thread that starts
  * or ends spans (it owns a per-thread, lock-free span staging area). */
-void otel_thread_register(void);
-void otel_thread_unregister(void);
+OTEL_API void otel_thread_register(void);
+OTEL_API void otel_thread_unregister(void);
 
 /* ---- exporter wiring (called by the embedder, e.g. libevpl) ---- */
 
@@ -203,7 +213,7 @@ void otel_thread_unregister(void);
  * only valid for the duration of the call -- copy it if you send asynchronously.
  */
 typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
-void otel_set_transport(otel_transport_fn fn, void *priv);
+OTEL_API void otel_set_transport(otel_transport_fn fn, void *priv);
 
 /*
  * Span sink: an alternative (or additional) consumer fed the raw finished spans
@@ -228,11 +238,11 @@ struct otel_span_sink {
     void (*end)(void *priv);
     void  *priv;
 };
-void otel_set_span_sink(const struct otel_span_sink *sink);   /* NULL detaches */
+OTEL_API void otel_set_span_sink(const struct otel_span_sink *sink);   /* NULL detaches */
 
 /* The configured OTLP service.name (set via otel_init).  Useful to a span sink
  * that wants to denormalize the service onto each stored span. */
-const char *otel_service_name(void);
+OTEL_API const char *otel_service_name(void);
 
 /*
  * Per-thread ring capacity (finished-span backlog) in spans; must be a power of
@@ -243,7 +253,7 @@ const char *otel_service_name(void);
  * Takes effect for threads registered after the call; set it before
  * otel_thread_register().  Default OTEL_RING_SIZE (2048).
  */
-void otel_set_ring_capacity(unsigned int spans);
+OTEL_API void otel_set_ring_capacity(unsigned int spans);
 
 /*
  * Head-sampling ratio in [0,1]: the probability that a newly started (root)
@@ -254,7 +264,7 @@ void otel_set_ring_capacity(unsigned int spans);
  * so the inline hot path below short-circuits to nothing.  Thread-safe to set at
  * startup; treat as configuration, not a per-request knob.
  */
-void otel_set_sampler(double ratio);
+OTEL_API void otel_set_sampler(double ratio);
 
 /*
  * Runtime master switch.  Tracing is live only when a transport is registered
@@ -263,12 +273,12 @@ void otel_set_sampler(double ratio);
  * in-flight spans already recording still complete.  Re-enabling resumes new
  * traces.  Use this for a runtime on/off knob without rebuilding.
  */
-void otel_set_enabled(int enabled);
+OTEL_API void otel_set_enabled(int enabled);
 
 /* Override the wall-clock source (default clock_gettime(CLOCK_REALTIME)).  Lets
  * the embedder inject a TSC-backed clock.  Must return nanoseconds since the
  * Unix epoch. */
-void otel_set_clock(uint64_t (*now_unix_ns)(void));
+OTEL_API void otel_set_clock(uint64_t (*now_unix_ns)(void));
 
 /*
  * Collect finished spans from all registered threads, encode them into
@@ -276,10 +286,10 @@ void otel_set_clock(uint64_t (*now_unix_ns)(void));
  * by the embedder's exporter driver (an event-loop hook or dedicated thread).
  * Returns the number of spans emitted.
  */
-int  otel_drain(void);
+OTEL_API int  otel_drain(void);
 
 /* Diagnostics: monotonically-increasing counters. */
-uint64_t otel_dropped_spans(void);  /* spans dropped due to staging overflow */
+OTEL_API uint64_t otel_dropped_spans(void);  /* spans dropped due to staging overflow */
 
 /* ---- span hot path (no malloc, no locks) ----
  *
@@ -293,14 +303,14 @@ uint64_t otel_dropped_spans(void);  /* spans dropped due to staging overflow */
 
 /* Internal: live (a transport is registered) and slow paths.  Do not call the
  * trailing-underscore symbols directly; use the inline wrappers. */
-extern int otel_enabled_;
-void otel_span_start_root_(struct otel_span *s, const char *name, uint8_t kind);
-void otel_span_start_child_(struct otel_span *s, const char *name, uint8_t kind,
+extern OTEL_API int otel_enabled_;
+OTEL_API void otel_span_start_root_(struct otel_span *s, const char *name, uint8_t kind);
+OTEL_API void otel_span_start_child_(struct otel_span *s, const char *name, uint8_t kind,
                             const struct otel_span *parent);
-void otel_span_start_remote_(struct otel_span *s, const char *name, uint8_t kind,
+OTEL_API void otel_span_start_remote_(struct otel_span *s, const char *name, uint8_t kind,
                              const uint8_t trace_id[16], uint64_t parent_id);
-struct otel_event *otel_span_event_(struct otel_span *s, const char *name);
-void otel_span_end_(struct otel_span *s);
+OTEL_API struct otel_event *otel_span_event_(struct otel_span *s, const char *name);
+OTEL_API void otel_span_end_(struct otel_span *s);
 
 /* Reserve `n` bytes from the span's arena (rounded up to OTEL_ARENA_ALIGN so the
  * next allocation stays aligned) and return the byte offset, or OTEL_NIL if it
@@ -737,7 +747,12 @@ otel_span_end(struct otel_span *s)
  * elides.  No symbol from liboteltracing-c is referenced, so the library need
  * not be linked.
  */
+#ifdef _MSC_VER
+/* MSVC C rejects empty structs. Calls still elide and require no library. */
+struct otel_span { char unused; };
+#else
 struct otel_span { };
+#endif
 struct otel_event;   /* opaque event handle; never dereferenced in this mode */
 
 typedef void (*otel_transport_fn)(const void *buf, size_t len, void *priv);
