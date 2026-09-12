@@ -136,7 +136,10 @@ add_test(NAME otel_disabled_test COMMAND otel_disabled_test)
 option(OTEL_SQLITE "Build the optional SQLite span sink and otel-trace CLI" ON)
 
 if(OTEL_SQLITE)
-    find_package(SQLite3 REQUIRED)
+    find_package(SQLite3 QUIET)
+endif()
+
+if(OTEL_SQLITE AND SQLite3_FOUND)
     if(TARGET SQLite3::SQLite3)
         set(SQLITE3_LIB SQLite3::SQLite3)
     else()
@@ -172,6 +175,9 @@ if(OTEL_SQLITE)
     install(TARGETS oteltracing-sqlite otel-trace
         RUNTIME DESTINATION bin LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
     install(FILES otel_sqlite.h DESTINATION include)
+elseif(OTEL_SQLITE)
+    message(STATUS "oteltracing-c: libsqlite3 not found; "
+                   "skipping SQLite sink and otel-trace CLI")
 endif()
 install(TARGETS oteltracing-c
     RUNTIME DESTINATION bin LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)

@@ -70,6 +70,12 @@ jobs:
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --no-tests=error --timeout 60 --output-junit results.xml
       - name: Install
         run: cmake --install build --config ${{ matrix.config }} --prefix install
+      - name: Build and test with SQLite unavailable
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build-no-sqlite -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }} -DCMAKE_PREFIX_PATH=/opt/homebrew -DCMAKE_DISABLE_FIND_PACKAGE_SQLite3=TRUE
+          cmake --build build-no-sqlite --parallel 4
+          ctest --test-dir build-no-sqlite --output-on-failure --no-tests=error --timeout 60
       - name: Include Windows runtime dependencies
         if: runner.os == 'Windows'
         run: Copy-Item build/bin/${{ matrix.config }}/*.dll install/bin -Force
