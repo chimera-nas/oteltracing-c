@@ -166,9 +166,11 @@ main(void)
             /* Child status + attr. */
             CHECK(sp_child->n_attributes == 1);
             CHECK(sp_child->status != NULL);
-            CHECK(sp_child->status->code ==
-                  OPENTELEMETRY__PROTO__TRACE__V1__STATUS__STATUS_CODE__STATUS_CODE_ERROR);
-            CHECK(strcmp(sp_child->status->message, "boom") == 0);
+            if (sp_child->status) {
+                CHECK(sp_child->status->code ==
+                      OPENTELEMETRY__PROTO__TRACE__V1__STATUS__STATUS_CODE__STATUS_CODE_ERROR);
+                CHECK(strcmp(sp_child->status->message, "boom") == 0);
+            }
         }
 
         opentelemetry__proto__collector__trace__v1__export_trace_service_request__free_unpacked(
