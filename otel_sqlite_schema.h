@@ -23,7 +23,9 @@
 /* Attribute value types stored in span_attrs.type (mirror enum otel_attr_type).
  * The CLI uses these to pick which value column to read. */
 
+#ifndef _MSC_VER
 __attribute__((unused))
+#endif
 static const char OTEL_SQLITE_SCHEMA[] =
     "CREATE TABLE IF NOT EXISTS spans ("
     "  id              INTEGER PRIMARY KEY,"

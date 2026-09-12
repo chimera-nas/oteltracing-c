@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <pthread.h>
+#include "otel_platform.h"
 
 #include <sqlite3.h>
 
@@ -30,9 +30,6 @@
 #include "otel_sqlite.h"
 #include "otel_sqlite_schema.h"
 
-#ifndef SYMBOL_EXPORT
-#define SYMBOL_EXPORT __attribute__((visibility("default")))
-#endif
 
 /* Default drain cadence if the caller passes 0. */
 #define OTEL_SQLITE_DEFAULT_INTERVAL_MS 250
@@ -54,9 +51,9 @@ static struct {
     unsigned long max_spans;       /* retention cap, 0 = unlimited */
 
     /* Flusher thread. */
-    pthread_t       thread;
-    pthread_mutex_t lock;
-    pthread_cond_t  cond;
+    otel_thread       thread;
+    otel_mutex lock;
+    otel_cond  cond;
     int             running;
     int             have_thread;
     unsigned int    interval_ms;
@@ -281,23 +278,16 @@ otel_sqlite_flusher(void *arg)
 {
     (void) arg;
 
-    pthread_mutex_lock(&S.lock);
+    otel_mutex_lock(&S.lock);
     while (S.running) {
-        struct timespec ts;
-
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (long) (S.interval_ms % 1000) * 1000000L;
-        ts.tv_sec  += (time_t) (S.interval_ms / 1000) + ts.tv_nsec / 1000000000L;
-        ts.tv_nsec %= 1000000000L;
-
-        pthread_cond_timedwait(&S.cond, &S.lock, &ts);
+        otel_cond_wait_ms(&S.cond, &S.lock, S.interval_ms);
 
         /* Drain outside the lock: it may take a while and must not block close(). */
-        pthread_mutex_unlock(&S.lock);
+        otel_mutex_unlock(&S.lock);
         otel_drain();
-        pthread_mutex_lock(&S.lock);
+        otel_mutex_lock(&S.lock);
     }
-    pthread_mutex_unlock(&S.lock);
+    otel_mutex_unlock(&S.lock);
     return NULL;
 }
 
@@ -377,10 +367,10 @@ otel_sqlite_open(
     /* Spawn the dedicated flusher thread. */
     S.interval_ms = flush_interval_ms ? flush_interval_ms
                                       : OTEL_SQLITE_DEFAULT_INTERVAL_MS;
-    pthread_mutex_init(&S.lock, NULL);
-    pthread_cond_init(&S.cond, NULL);
+    otel_mutex_init(&S.lock);
+    otel_cond_init(&S.cond);
     S.running = 1;
-    if (pthread_create(&S.thread, NULL, otel_sqlite_flusher, NULL) != 0) {
+    if (otel_thread_create(&S.thread, otel_sqlite_flusher, NULL) != 0) {
         fprintf(stderr, "otel_sqlite: flusher thread create failed\n");
         S.running = 0;
         otel_sqlite_close();
@@ -395,14 +385,14 @@ otel_sqlite_close(void)
 {
     /* Stop the flusher thread first. */
     if (S.have_thread) {
-        pthread_mutex_lock(&S.lock);
+        otel_mutex_lock(&S.lock);
         S.running = 0;
-        pthread_cond_signal(&S.cond);
-        pthread_mutex_unlock(&S.lock);
-        pthread_join(S.thread, NULL);
+        otel_cond_signal(&S.cond);
+        otel_mutex_unlock(&S.lock);
+        otel_thread_join(S.thread);
         S.have_thread = 0;
-        pthread_cond_destroy(&S.cond);
-        pthread_mutex_destroy(&S.lock);
+        otel_cond_destroy(&S.cond);
+        otel_mutex_destroy(&S.lock);
     }
 
     /* Final drain to flush any spans still in the rings (sink still attached). */

@@ -20,18 +20,16 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <stdatomic.h>
-#include <pthread.h>
 #include <time.h>
-#include <arpa/inet.h>
-#include <uuid/uuid.h>
 
 /* The library implementation always needs the full definitions, regardless of
  * any -DOTEL_TRACING=0 in the surrounding build. */
 #undef OTEL_TRACING
 #define OTEL_TRACING 1
 #include "oteltracing.h"
+#include "otel_platform.h"
+#include "otel_random.h"
 
 #include "stopwatch.h"
 
@@ -40,9 +38,6 @@
 #include "opentelemetry/proto/common/v1/common.pb-c.h"
 #include "opentelemetry/proto/resource/v1/resource.pb-c.h"
 
-#ifndef SYMBOL_EXPORT
-#define SYMBOL_EXPORT __attribute__((visibility("default")))
-#endif
 
 /* Per-thread ring capacity (spans).  Power of two.  Allocated once at thread
  * registration; ring-full simply drops + counts. */
@@ -94,8 +89,8 @@ typedef Opentelemetry__Proto__Common__V1__AnyValue                            ot
  * big-endian length, immediately followed by the protobuf payload. */
 struct grpc_hdr {
     uint8_t  compressed;
-    uint32_t length;
-} __attribute__((packed));
+    uint8_t  length[4];
+};
 
 /* Per-thread context: a lock-free SPSC ring of finished spans.  The home thread
  * is the sole producer (head); otel_drain() is the sole consumer (tail). */
@@ -106,7 +101,7 @@ struct otel_thread_ctx {
     _Atomic uint64_t         head;       /* producer cursor */
     _Atomic uint64_t         tail;       /* consumer cursor */
     _Atomic uint64_t         dropped;    /* ring-full drops on this thread */
-    __uint128_t              randstate;  /* PCG-style id generator state */
+    struct otel_random_state randstate;  /* PCG-style id generator state */
     struct otel_thread_ctx  *next;       /* global registry list */
 };
 
@@ -167,10 +162,10 @@ static struct {
     int                       transport_present;
     int                       runtime_on;
 
-    pthread_rwlock_t          registry_lock;  /* guards the thread-ctx list */
+    otel_rwlock          registry_lock;  /* guards the thread-ctx list */
     struct otel_thread_ctx   *threads;
 
-    pthread_mutex_t           drain_lock;      /* serializes otel_drain + batch */
+    otel_mutex           drain_lock;      /* serializes otel_drain + batch */
     struct otel_otlp          otlp;
 
     _Atomic uint64_t          dropped_spans;   /* aggregated, plus per-thread */
@@ -183,7 +178,7 @@ static struct {
     uint64_t                  wall_base_ns;
 } OT;
 
-static __thread struct otel_thread_ctx *otel_tls;
+static OTEL_THREAD_LOCAL struct otel_thread_ctx *otel_tls;
 
 /* Per-thread ring capacity used when a thread registers; tunable before any
  * registration via otel_set_ring_capacity().  Power of two. */
@@ -228,8 +223,7 @@ otel_set_sampler(double ratio)
 static inline uint64_t
 otel_rand(struct otel_thread_ctx *ctx)
 {
-    ctx->randstate *= (__uint128_t) UINT64_C(0xda942042e4dd58b5);
-    return (uint64_t) (ctx->randstate >> 64);
+    return otel_random_next(&ctx->randstate);
 }
 
 /* ---- process / thread lifecycle ---- */
@@ -244,7 +238,7 @@ otel_init(const char *service)
     memset(&OT, 0, sizeof(OT));
 
     snprintf(OT.service, sizeof(OT.service), "%s", service ? service : "unknown");
-    if (gethostname(OT.hostname, sizeof(OT.hostname)) != 0) {
+    if (otel_hostname(OT.hostname, sizeof(OT.hostname)) != 0) {
         snprintf(OT.hostname, sizeof(OT.hostname), "unknown");
     }
     OT.hostname[sizeof(OT.hostname) - 1] = '\0';
@@ -254,7 +248,7 @@ otel_init(const char *service)
     {
         struct timespec ts;
         stopwatch_context_init(&OT.sw_ctx);
-        clock_gettime(CLOCK_REALTIME, &ts);
+        otel_realtime(&ts);
         OT.wall_base_ns = (uint64_t) ts.tv_sec * 1000000000ULL +
             (uint64_t) ts.tv_nsec;
         stopwatch_start(&OT.sw_ctx, &OT.sw_base);
@@ -271,8 +265,8 @@ otel_init(const char *service)
     OT.transport_present = 0;
     otel_enabled_       = 0;
 
-    pthread_rwlock_init(&OT.registry_lock, NULL);
-    pthread_mutex_init(&OT.drain_lock, NULL);
+    otel_rwlock_init(&OT.registry_lock);
+    otel_mutex_init(&OT.drain_lock);
 
     /* One-time init of the reused protobuf-c batch scaffolding. */
     struct otel_otlp *o = &OT.otlp;
@@ -415,15 +409,15 @@ otel_thread_register(void)
     atomic_store_explicit(&ctx->tail, 0, memory_order_relaxed);
 
     /* Seed the per-thread id generator with a high-quality random value. */
-    uuid_generate((unsigned char *) &ctx->randstate);
-    if (ctx->randstate == 0) {
-        ctx->randstate = (__uint128_t) (uintptr_t) ctx ^ OT.clock();
+    otel_random_seed(&ctx->randstate);
+    if (ctx->randstate.lo == 0 && ctx->randstate.hi == 0) {
+        ctx->randstate.lo = ((uint64_t) (uintptr_t) ctx ^ OT.clock()) | 1;
     }
 
-    pthread_rwlock_wrlock(&OT.registry_lock);
+    otel_rwlock_wrlock(&OT.registry_lock);
     ctx->next   = OT.threads;
     OT.threads  = ctx;
-    pthread_rwlock_unlock(&OT.registry_lock);
+    otel_rwlock_write_unlock(&OT.registry_lock);
 
     otel_tls = ctx;
 }
@@ -443,12 +437,11 @@ otel_thread_unregister(void)
         return;
     }
 
-    /* Take the write lock (excludes any concurrent drain) so we can act as the
-     * sole consumer for this ring one last time, unlink, and free. */
-    pthread_rwlock_wrlock(&OT.registry_lock);
+    /* Match drain's lock order before consuming the ring and unlinking it. */
+    otel_mutex_lock(&OT.drain_lock);
+    otel_rwlock_wrlock(&OT.registry_lock);
 
     if (otel_enabled_) {
-        pthread_mutex_lock(&OT.drain_lock);
         if (OT.sink_present && OT.sink->begin) {
             OT.sink->begin(OT.sink->priv);
         }
@@ -457,7 +450,6 @@ otel_thread_unregister(void)
         if (OT.sink_present && OT.sink->end) {
             OT.sink->end(OT.sink->priv);
         }
-        pthread_mutex_unlock(&OT.drain_lock);
     }
 
     for (pp = &OT.threads; *pp; pp = &(*pp)->next) {
@@ -466,7 +458,8 @@ otel_thread_unregister(void)
             break;
         }
     }
-    pthread_rwlock_unlock(&OT.registry_lock);
+    otel_rwlock_write_unlock(&OT.registry_lock);
+    otel_mutex_unlock(&OT.drain_lock);
 
     free(ctx->ring);
     free(ctx);
@@ -485,18 +478,18 @@ otel_shutdown(void)
     }
 
     /* Threads are expected to unregister themselves; free any stragglers. */
-    pthread_rwlock_wrlock(&OT.registry_lock);
+    otel_rwlock_wrlock(&OT.registry_lock);
     while (OT.threads) {
         struct otel_thread_ctx *ctx = OT.threads;
         OT.threads = ctx->next;
         free(ctx->ring);
         free(ctx);
     }
-    pthread_rwlock_unlock(&OT.registry_lock);
+    otel_rwlock_write_unlock(&OT.registry_lock);
 
     free(OT.otlp.buf);
-    pthread_rwlock_destroy(&OT.registry_lock);
-    pthread_mutex_destroy(&OT.drain_lock);
+    otel_rwlock_destroy(&OT.registry_lock);
+    otel_mutex_destroy(&OT.drain_lock);
 
     OT.initialized = 0;
     otel_enabled_  = 0;
@@ -826,7 +819,7 @@ otlp_flush(void)
         &o->request, o->buf + sizeof(*hdr));
 
     hdr->compressed = 0;
-    hdr->length     = htonl((uint32_t) len);
+    otel_store_be32(hdr->length, (uint32_t) len);
 
     if (OT.transport) {
         OT.transport(o->buf, sizeof(*hdr) + len, OT.transport_priv);
@@ -880,8 +873,8 @@ otel_drain(void)
         return 0;
     }
 
-    pthread_mutex_lock(&OT.drain_lock);
-    pthread_rwlock_rdlock(&OT.registry_lock);
+    otel_mutex_lock(&OT.drain_lock);
+    otel_rwlock_rdlock(&OT.registry_lock);
 
     if (OT.sink_present && OT.sink->begin) {
         OT.sink->begin(OT.sink->priv);
@@ -897,8 +890,8 @@ otel_drain(void)
         OT.sink->end(OT.sink->priv);
     }
 
-    pthread_rwlock_unlock(&OT.registry_lock);
-    pthread_mutex_unlock(&OT.drain_lock);
+    otel_rwlock_read_unlock(&OT.registry_lock);
+    otel_mutex_unlock(&OT.drain_lock);
     return n;
 }
 

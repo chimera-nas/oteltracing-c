@@ -303,3 +303,34 @@ Inline capacity per span is bounded by `OTEL_SPAN_MAX_ATTRS` and
 MIT — see [LICENSE](LICENSE). The vendored OpenTelemetry protocol definitions
 under `opentelemetry/proto/` are Copyright OpenTelemetry Authors and licensed
 under Apache-2.0 (retained in their headers).
+
+## Native Windows builds
+
+Use Visual Studio 2022 / Build Tools with the C++ workload and Windows SDK,
+CMake 3.18 or later, and vcpkg. The checked-in manifest pins protobuf-c (including
+its code generator), protobuf, and SQLite. Initialize the stopwatch submodule.
+
+```powershell
+git submodule update --init --recursive
+cmake -S . -B build -G "Visual Studio 17 2022" -A ARM64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:/tools/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DVCPKG_TARGET_TRIPLET=arm64-windows -DVCPKG_HOST_TRIPLET=arm64-windows
+cmake --build build --config Release --parallel 4
+ctest --test-dir build -C Release --output-on-failure
+cmake --install build --config Release --prefix install
+```
+
+Use `-A x64` and `x64-windows` triplets on Intel/AMD Windows. DLLs and test
+executables share `build/bin/Release`; vcpkg copies dependency DLLs there.
+Distributing an installed DLL/CLI also requires those runtime dependency DLLs.
+CI artifacts include them in `install/bin`. `OTEL_SQLITE=ON` requires SQLite;
+pass `-DOTEL_SQLITE=OFF` for the core library alone.
+
+Windows uses native SRW locks, condition variables, CRT threads, TLS, BCrypt
+random seeding, and the stopwatch QPC timer. MSVC C11 atomics are enabled with
+`/experimental:c11atomics` for the internal SPSC rings. The public API does not
+expose atomic types. No POSIX compatibility runtime is required.
+
+With `OTEL_TRACING=0`, calls still compile away without linking the library.
+The disabled span occupies one byte with MSVC, which rejects empty C structs;
+GCC/Clang retain the existing zero-size extension.
